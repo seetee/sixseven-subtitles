@@ -1,0 +1,32 @@
+[Desktop Entry]
+Type=Service
+MimeType=video/webm;
+Actions=addCaptionsClassic;addCaptionsPick;
+X-KDE-Submenu=Captions
+X-KDE-Priority=TopLevel
+X-KDE-RequiredNumberOfUrls=1
+
+[Desktop Action addCaptionsClassic]
+Name=Add captions (Swedish, classic)
+Icon=subtitles
+Exec=konsole --hold -e /home/kenneth/.local/bin/caption %f
+
+[Desktop Action addCaptionsPick]
+Name=Add captions (choose theme…)
+Icon=subtitles
+Exec=konsole --hold -e /home/kenneth/.local/bin/caption --ask-theme %f
+
+# ---------------------------------------------------------------------------
+# INSTALL (KDE Plasma 6 / Frameworks 6)
+#   mkdir -p ~/.local/share/kio/servicemenus
+#   cp add-captions.desktop ~/.local/share/kio/servicemenus/
+#   chmod +x ~/.local/share/kio/servicemenus/add-captions.desktop   # REQUIRED on Plasma 6
+#   kbuildsycoca6        # refresh menus, then reopen Dolphin
+#
+# Right-click a .webm -> Captions -> Add captions.
+# Notes:
+#   * %f is the file's local path (quoting handled for you).
+#   * konsole --hold keeps the window open so you can read the result / answer prompts.
+#   * Icon "subtitles" may not exist in every icon theme; if it's blank the entry still
+#     works — pick another name with plasma-sdk's Cuttlefish or from /usr/share/icons.
+# ---------------------------------------------------------------------------

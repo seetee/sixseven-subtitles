@@ -1,0 +1,61 @@
+# themes.toml — caption looks. Add a new [section] to make a new theme; you only
+# need to set what differs from the defaults. Use it with:  caption clip.webm --theme NAME
+#
+# Keys you can set:
+#   font            font family name (must be installed, e.g. fc-list | grep -i montserrat)
+#   font_size       integer, sized for a 1080-wide frame
+#   base_colour     "#RRGGBB"  normal text
+#   accent_colour   "#RRGGBB"  the active / highlighted word
+#   outline         "#RRGGBB"  outline colour
+#   outline_width   integer px
+#   shadow          integer px (0 = none)
+#   position        "bottom" | "centre" | "top"
+#   margin_v        integer px from that edge (omit to use the position's sensible default)
+#   words_per_line  integer (1 = one word at a time)
+#   animation       "pop"  (word appears/recolours) | "sweep" (colour fills across the word)
+#   pop_scale       float size bump on the active word, pop only (1.0 = no bump)
+#   bold            true | false
+
+# The canonical look: white text, yellow active word, lower third.
+[classic]
+# all defaults — listed here for reference
+font = "DejaVu Sans"
+font_size = 90
+base_colour = "#FFFFFF"
+accent_colour = "#FFD23F"
+outline = "#000000"
+outline_width = 6
+position = "bottom"
+words_per_line = 3
+animation = "pop"
+pop_scale = 1.12
+
+# Two words, centred, cool cyan highlight.
+[cyan-centre]
+accent_colour = "#34E0E0"
+position = "centre"
+words_per_line = 2
+
+# Punchy single-word reveal, dead still (no size bump).
+[one-word]
+words_per_line = 1
+pop_scale = 1.0
+
+# Smooth karaoke fill rather than a pop.
+[sweep]
+animation = "sweep"
+accent_colour = "#FFD23F"
+words_per_line = 4
+
+# Bold magenta, sitting near the top (useful when the lower third is busy).
+[top-magenta]
+accent_colour = "#FF4FA3"
+position = "top"
+words_per_line = 3
+font_size = 84
+
+# Soft mint highlight, slightly smaller, lower third.
+[mint]
+accent_colour = "#7BE0A6"
+outline_width = 5
+words_per_line = 3

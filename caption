@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""
+caption — one command to put trendy, word-by-word Swedish captions on a vertical clip.
+
+Flow:
+    webm in
+      -> extract 16 kHz mono audio                     (ffmpeg)
+      -> transcribe + word-align, Swedish              (WhisperX + KB-Whisper + VoxRex)
+      -> write an EDITABLE transcript                   (low-confidence words marked [?])
+      -> you fix misheard / misspelt words in $EDITOR / Kate
+      -> re-time: keep timings if a line's word count is unchanged,
+         otherwise re-align just that line against the audio
+      -> build a themed ASS file                        (themes.toml)
+      -> burn it into the .webm                         (ffmpeg, VP8 / copy Vorbis)
+
+Usage:
+    caption clip.webm                       # classic theme, with review step
+    caption clip.webm --theme cyan-centre
+    caption clip.webm --no-review           # fully unattended
+    caption clip.webm --ask-theme           # pick a theme interactively (used by the menu)
+
+Only the standard library is imported at the top, so the file loads without the heavy
+ML deps present; torch / whisperx are imported lazily, inside the functions that need them.
+"""
+
+import argparse
+import gc
+import importlib.util
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import tomllib                       # Python 3.11+
+except ModuleNotFoundError:              # older Python: pip install tomli
+    import tomli as tomllib
+
+# --------------------------------------------------------------------------- #
+#  Defaults
+# --------------------------------------------------------------------------- #
+DEFAULT_MODEL = "KBLab/kb-whisper-small"
+ALIGN_MODEL   = "KBLab/wav2vec2-large-voxrex-swedish"
+LANG          = "sv"
+FLAG_BELOW    = 0.5                       # words below this alignment score get a [?]
+
+# Where the heavy ML dependencies live. Overridable with CAPTION_VENV.
+# Defaults to the path suggested in the manual install, so an existing one is reused.
+VENV_DIR = Path(os.environ.get("CAPTION_VENV", Path.home() / ".venvs" / "caption")).expanduser()
+DEPS = ("whisperx", "torch")
+
+# A theme only needs to override what differs; these fill in the rest.
+THEME_DEFAULTS = {
+    "font":           "DejaVu Sans",
+    "font_size":      90,
+    "base_colour":    "#FFFFFF",
+    "accent_colour":  "#FFD23F",
+    "outline":        "#000000",
+    "outline_width":  6,
+    "shadow":         0,
+    "position":       "bottom",          # bottom | centre | top
+    "margin_v":       None,              # None -> use the position's default
+    "margin_h":       80,                # side margin (px); text wraps to stay inside it
+    "wrap":           0,                 # libass WrapStyle: 0 = balanced wrap, 2 = no wrap
+    "words_per_line": 3,                 # target words per on-screen row (1 = one word at a time)
+    "animation":      "pop",             # pop | sweep
+    "pop_scale":      1.12,              # size bump on the active word (pop only); 1.0 = none
+    "bold":           True,
+    "play_w":         1080,
+    "play_h":         1920,
+}
+POSITION = {                             # name -> (ASS alignment, default MarginV)
+    "bottom": (2, 380),
+    "centre": (5, 0),
+    "top":    (8, 150),
+}
+
+BUILTIN_THEME = {"classic": {}}          # used if no themes.toml is found at all
+
+
+# --------------------------------------------------------------------------- #
+#  Small helpers
+# --------------------------------------------------------------------------- #
+def die(msg, code=1):
+    print(f"caption: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def need(tool):
+    if shutil.which(tool) is None:
+        die(f"'{tool}' not found on PATH. Please install it first.")
+
+
+def run(cmd, quiet=False):
+    if not quiet:
+        print("  $", " ".join(shlex.quote(c) for c in cmd))
+    subprocess.run(cmd, check=True)
+
+
+def hex_to_ass(h, alpha="00"):
+    """#RRGGBB -> ASS &HAABBGGRR (alpha 00 = opaque)."""
+    h = h.lstrip("#")
+    rr, gg, bb = h[0:2], h[2:4], h[4:6]
+    return f"&H{alpha}{bb}{gg}{rr}".upper()
+
+
+def ts(t):
+    """seconds -> H:MM:SS.cs  (ASS timestamp)."""
+    cs = int(round(max(0.0, t) * 100))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+# --------------------------------------------------------------------------- #
+#  Dependency preflight + self-bootstrapping virtual environment
+# --------------------------------------------------------------------------- #
+def have_deps():
+    """True if WhisperX and torch are importable in the CURRENT interpreter."""
+    return all(importlib.util.find_spec(m) is not None for m in DEPS)
+
+
+def venv_python():
+    return VENV_DIR / "bin" / "python"
+
+
+def venv_has_deps():
+    py = venv_python()
+    if not py.exists():
+        return False
+    # Actually import torch (and torchvision if present) so a broken/mismatched build
+    # is caught here and repaired, rather than passing a find_spec-only check.
+    check = (
+        "import importlib.util as u, sys\n"
+        "try:\n"
+        "    import torch\n"
+        "    if u.find_spec('torchvision') is not None:\n"
+        "        import torchvision\n"
+        "    ok = all(u.find_spec(m) is not None for m in ('whisperx', 'torchaudio'))\n"
+        "except Exception:\n"
+        "    ok = False\n"
+        "sys.exit(0 if ok else 1)\n"
+    )
+    return subprocess.run([str(py), "-c", check]).returncode == 0
+
+
+def install_hint():
+    """Print the manual recipe and exit. This is the --no-bootstrap behaviour."""
+    print(f"""
+caption needs WhisperX and PyTorch, which aren't installed.
+
+  Automatic (default):  run caption again WITHOUT --no-bootstrap and it will
+                        create a private environment and install them for you.
+
+  Manual, if you prefer:
+    python3 -m venv {VENV_DIR}
+    source {VENV_DIR}/bin/activate
+    pip install -U pip
+    pip install whisperx
+    pip install --force-reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+    pip uninstall -y torchvision torchcodec   # unused here; avoid torch/companion clashes
+    deactivate
+
+Then run caption as usual.""".rstrip(), file=sys.stderr)
+    sys.exit(1)
+
+
+def create_venv_and_install(gpu, assume_yes):
+    print("WhisperX / PyTorch are not installed.")
+    print(f"  I can set them up in a private virtual environment at:\n    {VENV_DIR}")
+    print("  This downloads PyTorch + WhisperX (a few GB) the first time.")
+    if not assume_yes:
+        try:
+            ans = input("  Proceed? [Y/n] ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans not in ("", "y", "yes"):
+            install_hint()
+
+    if not VENV_DIR.exists():
+        print("  Creating virtual environment…")
+        if subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)]).returncode != 0:
+            die("could not create a venv. On Debian/Ubuntu: sudo apt install python3-venv")
+
+    pip = [str(venv_python()), "-m", "pip"]
+    subprocess.run(pip + ["install", "-U", "pip"], check=True)
+    print("  Installing WhisperX…")
+    subprocess.run(pip + ["install", "whisperx"], check=True)
+    if gpu:
+        print("  Keeping the default (CUDA) build of torch for GPU use.")
+    else:
+        print("  Pinning the smaller CPU build of torch…")
+        subprocess.run(pip + ["install", "--force-reinstall", "torch", "torchaudio",
+                              "--index-url", "https://download.pytorch.org/whl/cpu"], check=True)
+        # WhisperX does not use vision, and it feeds Pyannote in-memory audio (so torchcodec's
+        # file decoder is never used). Both are compiled against a specific torch and, with the
+        # latest CPU torch, mismatch — torchvision fatally ("operator torchvision::nms does not
+        # exist"), torchcodec as a noisy warning. Neither is needed here, so remove them.
+        subprocess.run(pip + ["uninstall", "-y", "torchvision", "torchcodec"])
+    print("  Dependencies ready.\n")
+
+
+def ensure_deps(no_bootstrap, gpu, assume_yes):
+    """Guarantee WhisperX/torch are available, bootstrapping a venv and re-exec'ing if needed."""
+    if have_deps():
+        return                                   # current interpreter is already equipped
+    if os.environ.get("CAPTION_BOOTSTRAPPED") == "1":
+        # We already re-exec'd into the venv and they're STILL missing -> a real problem.
+        die("the virtual environment is missing WhisperX/torch even after setup. "
+            f"Try removing {VENV_DIR} and running again.")
+    if no_bootstrap:
+        install_hint()
+    if not venv_has_deps():
+        create_venv_and_install(gpu, assume_yes)
+    # hand over to the venv's interpreter, same arguments
+    py = venv_python()
+    print(f"caption: using {py}")
+    os.environ["CAPTION_BOOTSTRAPPED"] = "1"
+    os.execv(str(py), [str(py), os.path.abspath(__file__), *sys.argv[1:]])
+
+
+# --------------------------------------------------------------------------- #
+#  Themes
+# --------------------------------------------------------------------------- #
+def find_themes_file(explicit):
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates += [
+        Path.home() / ".config" / "caption" / "themes.toml",
+        Path(__file__).resolve().parent / "themes.toml",
+        Path.cwd() / "themes.toml",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def load_themes(explicit):
+    path = find_themes_file(explicit)
+    if path is None:
+        print("note: no themes.toml found — using the built-in 'classic' theme.")
+        return BUILTIN_THEME
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+    if not data:
+        die(f"{path} has no themes in it.")
+    return data
+
+
+def resolve_theme(themes, name):
+    if name not in themes:
+        die(f"theme '{name}' not found. Available: {', '.join(sorted(themes))}")
+    merged = dict(THEME_DEFAULTS)
+    merged.update(themes[name])          # override only what the theme sets
+    return merged
+
+
+# --------------------------------------------------------------------------- #
+#  Step 1 — audio
+# --------------------------------------------------------------------------- #
+def extract_audio(src, wav):
+    print("[1/5] Extracting audio (16 kHz mono)…")
+    run(["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", str(wav)])
+
+
+# --------------------------------------------------------------------------- #
+#  Step 2 — transcribe + align
+# --------------------------------------------------------------------------- #
+def transcribe(wav, model_name, device, compute_type, batch, cache,
+               vad_options=None, asr_options=None):
+    """Return (segments, align_model, metadata, audio). Frees the ASR model afterwards."""
+    print("[2/5] Transcribing and aligning Swedish (first run downloads the models)…")
+    import torch                          # noqa: F401  (lazy)
+    import whisperx
+
+    load_kw = dict(compute_type=compute_type, language=LANG, download_root=str(cache))
+    if vad_options:
+        load_kw["vad_options"] = vad_options
+    if asr_options:
+        load_kw["asr_options"] = asr_options
+    asr = whisperx.load_model(model_name, device, **load_kw)
+    audio = whisperx.load_audio(str(wav))
+    result = asr.transcribe(audio, batch_size=batch, language=LANG)
+
+    model_a, metadata = whisperx.load_align_model(
+        language_code=LANG, device=device, model_name=ALIGN_MODEL, model_dir=str(cache))
+    aligned = whisperx.align(result["segments"], model_a, metadata, audio, device,
+                             return_char_alignments=False)
+
+    # the big ASR model is no longer needed while you edit
+    del asr
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    return aligned["segments"], model_a, metadata, audio
+
+
+def realign_text(text, start, end, model_a, metadata, audio, device):
+    """Re-align a single corrected line against the audio; return its word list."""
+    import whisperx
+    seg = {"start": float(start), "end": float(end), "text": text}
+    out = whisperx.align([seg], model_a, metadata, audio, device,
+                         return_char_alignments=False)
+    return out["segments"][0].get("words", [])
+
+
+def realign_within(tokens, start, end, model_a, metadata, audio, device):
+    """Align a row's words inside [start, end]; fall back to an even spread if alignment
+    returns nothing (e.g. speech too faint for the aligner to place)."""
+    words = clean_words(realign_text(" ".join(tokens), start, end,
+                                     model_a, metadata, audio, device))
+    if not words:
+        span = max(0.01, (end - start)) / max(1, len(tokens))
+        words = [{"word": t, "start": start + k * span, "end": start + (k + 1) * span}
+                 for k, t in enumerate(tokens)]
+    return words
+
+
+# --------------------------------------------------------------------------- #
+#  Transcript round-trip
+# --------------------------------------------------------------------------- #
+def clean_words(raw_words):
+    """Drop tokens with no timing, attaching their text to the previous timed word."""
+    out = []
+    for w in raw_words:
+        token = (w.get("word") or "").strip()
+        if not token:
+            continue
+        if "start" in w and "end" in w and w["start"] is not None and w["end"] is not None:
+            out.append({"word": token, "start": float(w["start"]),
+                        "end": float(w["end"]), "score": w.get("score")})
+        elif out:                        # untimed token -> merge into the previous word
+            out[-1]["word"] += " " + token
+    return out
+
+
+def write_transcript(segments, path, flag_below):
+    """Write an editable transcript; return the cleaned per-segment word lists."""
+    print("[3/5] Writing the transcript for review…")
+    cleaned = []
+    lines = [
+        "# Fix any misheard or misspelt words below, then save and close this file.",
+        "# What you leave here is exactly what gets captioned.",
+        "# Format:  <number> | <the spoken words on that line>",
+        "#   * [?] marks a word the aligner was unsure about — check these first.",
+        "#   * Edit the words on a line freely (fix spelling, change the whole line).",
+        "#   * ADD a line the recogniser missed: write it on its own line, in reading",
+        "#     order, e.g.   + de här orden var för tysta   (the leading + is optional).",
+        "#   * DELETE a caption: remove its line, or clear the words after the | .",
+        "#   * Added and changed lines are re-timed against the audio automatically;",
+        "#     unchanged lines keep their exact timing.",
+        "#",
+    ]
+    for i, seg in enumerate(segments):
+        words = clean_words(seg.get("words", []))
+        cleaned.append(words)
+        shown = []
+        for w in words:
+            mark = "[?]" if (w.get("score") is None or w["score"] < flag_below) else ""
+            shown.append(mark + w["word"])
+        lines.append(f"{i + 1:04d} | " + " ".join(shown))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cleaned
+
+
+def open_editor(path):
+    """Open $VISUAL/$EDITOR (or Kate) and block until the user is done."""
+    ed = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "kate"
+    argv = shlex.split(ed)
+    base = os.path.basename(argv[0])
+    flags = {"kate": "--block", "kwrite": "--block",
+             "gedit": "--wait", "gnome-text-editor": "--wait",
+             "code": "--wait", "codium": "--wait"}
+    if base in flags and not any(f in argv for f in ("--block", "-b", "--wait", "-w")):
+        argv.append(flags[base])
+
+    print(f"      Opening '{base}' — edit the words, then save and close.")
+    before = path.stat().st_mtime
+    t0 = time.time()
+    subprocess.run(argv + [str(path)])
+    # Safety net for a GUI editor that forked and returned at once:
+    if time.time() - t0 < 1.5 and path.stat().st_mtime == before:
+        try:
+            input("      If the editor opened in its own window, save it, then press Enter… ")
+        except EOFError:
+            pass
+
+
+_ROW = re.compile(r"^\s*(\d+)\s*\|\s*(.*)$")
+
+
+def read_transcript(path):
+    """Return the rows in file order. Each entry is:
+        {"kind": "existing", "idx": N, "tokens": [...]}   for a  '<num> | words'  row
+        {"kind": "new",                "tokens": [...]}   for any other line with text
+    A leading '+' (and an optional following '|') on a new line is stripped.
+    """
+    entries = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = _ROW.match(line)
+        if m:
+            toks = [t.replace("[?]", "") for t in m.group(2).split()]
+            entries.append({"kind": "existing", "idx": int(m.group(1)) - 1,
+                            "tokens": [t for t in toks if t]})
+        else:
+            body = s
+            if body.startswith("+"):
+                body = body[1:].lstrip()
+                if body.startswith("|"):
+                    body = body[1:].lstrip()
+            toks = [t.replace("[?]", "") for t in body.split()]
+            entries.append({"kind": "new", "tokens": [t for t in toks if t]})
+    return entries
+
+
+# --------------------------------------------------------------------------- #
+#  Re-time after editing
+# --------------------------------------------------------------------------- #
+def retime(orig_segments, orig_words, entries, model_a, metadata, audio, device, duration):
+    """Turn the edited rows into per-row word lists with timings.
+
+    * an unchanged existing row keeps its exact word timings;
+    * a changed existing row is re-aligned within its original window;
+    * a NEW row is re-aligned within the time gap between its neighbours
+      (the aligner matches phonemes to the waveform, so it needs no manual timestamp);
+    * an emptied row is dropped.
+
+    Returns a list of per-row word lists, in the order the rows appear.
+    """
+    print("[4/5] Re-timing (added and changed lines are aligned to the audio)…")
+    n = len(entries)
+
+    # 1) window for each row: existing rows take their segment window; new rows are None
+    win = [None] * n
+    for i, e in enumerate(entries):
+        if e["kind"] == "existing" and 0 <= e["idx"] < len(orig_segments):
+            seg = orig_segments[e["idx"]]
+            win[i] = [float(seg["start"]), float(seg["end"])]
+
+    # 2) fill runs of new rows from the surrounding anchors, subdividing the gap evenly
+    i = 0
+    while i < n:
+        if win[i] is not None:
+            i += 1
+            continue
+        j = i
+        while j < n and win[j] is None:
+            j += 1
+        gap_start = win[i - 1][1] if i - 1 >= 0 and win[i - 1] is not None else 0.0
+        gap_end = win[j][0] if j < n and win[j] is not None else float(duration)
+        if gap_end <= gap_start:                  # zero/degenerate gap: give it a moment
+            gap_end = gap_start + 0.5
+        step = (gap_end - gap_start) / (j - i)
+        for k in range(j - i):
+            win[i + k] = [gap_start + k * step, gap_start + (k + 1) * step]
+        i = j
+
+    # 3) build one word list per row
+    rows, realigned, added = [], 0, 0
+    for e, w in zip(entries, win):
+        tokens = e["tokens"]
+        if not tokens:                            # emptied -> drop
+            continue
+        if e["kind"] == "existing" and 0 <= e["idx"] < len(orig_words):
+            orig = orig_words[e["idx"]]
+            if len(tokens) == len(orig):          # same count -> keep exact timings
+                rows.append([{"word": t, "start": o["start"], "end": o["end"]}
+                             for t, o in zip(tokens, orig)])
+                continue
+            realigned += 1
+        else:
+            added += 1
+        rows.append(realign_within(tokens, w[0], w[1], model_a, metadata, audio, device))
+
+    print(f"      {realigned} changed line(s) re-aligned, {added} new line(s) placed; "
+          "the rest kept their timing.")
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+#  Step 5a — build the themed ASS
+# --------------------------------------------------------------------------- #
+def chunk(words, n):
+    for i in range(0, len(words), n):
+        yield words[i:i + n]
+
+
+def split_even(words, target):
+    """Split a word list into near-equal rows of at most `target` words, avoiding a
+    lone trailing word: 7 words at target 3 -> [3, 2, 2], not [3, 3, 1]."""
+    n = len(words)
+    if n == 0:
+        return []
+    target = max(1, int(target))
+    lines = -(-n // target)                       # ceil(n / target), no import needed
+    base, rem = divmod(n, lines)
+    out, k = [], 0
+    for i in range(lines):
+        size = base + (1 if i < rem else 0)
+        out.append(words[k:k + size])
+        k += size
+    return out
+
+
+def build_ass(segments_words, theme, path):
+    """segments_words: list of per-segment word lists (already re-timed)."""
+    print("[5/5] Building captions and burning them in…")
+    base   = hex_to_ass(theme["base_colour"])
+    accent = hex_to_ass(theme["accent_colour"])
+    outline = hex_to_ass(theme["outline"])
+    align, default_mv = POSITION[theme["position"]]
+    margin_v = theme["margin_v"] if theme["margin_v"] is not None else default_mv
+    bold = -1 if theme["bold"] else 0
+    sweep = theme["animation"] == "sweep"
+
+    # For a sweep the colours flip into the karaoke slots; for a pop we recolour by hand.
+    primary   = accent if sweep else base
+    secondary = base
+
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {theme['play_w']}\n"
+        f"PlayResY: {theme['play_h']}\n"
+        f"WrapStyle: {theme['wrap']}\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Cap,{theme['font']},{theme['font_size']},{primary},{secondary},{outline},"
+        f"&H64000000,{bold},0,0,0,100,100,0,0,1,{theme['outline_width']},{theme['shadow']},"
+        f"{align},{theme['margin_h']},{theme['margin_h']},{margin_v},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    pop = ""
+    if theme["pop_scale"] and theme["pop_scale"] != 1.0:
+        s = int(round(theme["pop_scale"] * 100))
+        pop = f"\\fscx{s}\\fscy{s}"
+
+    events = []
+    for words in segments_words:
+        for line in split_even(words, theme["words_per_line"]):
+            if not line:
+                continue
+            l_start, l_end = line[0]["start"], line[-1]["end"]
+
+            if sweep:
+                # one event; each word fills base -> accent over its own time
+                parts = []
+                for j, w in enumerate(line):
+                    nxt = line[j + 1]["start"] if j + 1 < len(line) else l_end
+                    cs = max(1, int(round((nxt - w["start"]) * 100)))
+                    parts.append(f"{{\\kf{cs}}}{w['word']}")
+                events.append(f"Dialogue: 0,{ts(l_start)},{ts(l_end)},Cap,,0,0,0,,{' '.join(parts)}")
+            else:
+                # one event per active word; that word is recoloured (and optionally enlarged)
+                for j, w in enumerate(line):
+                    start = w["start"]
+                    end = line[j + 1]["start"] if j + 1 < len(line) else w["end"]
+                    if end <= start:
+                        end = start + 0.04
+                    chips = []
+                    for k, ww in enumerate(line):
+                        if k == j:
+                            chips.append(f"{{\\c{accent}&{pop}}}{ww['word']}{{\\r}}")
+                        else:
+                            chips.append(ww["word"])
+                    events.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,{' '.join(chips)}")
+
+    path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+    return len(events)
+
+
+# --------------------------------------------------------------------------- #
+#  Step 5b — burn into the webm (VP8 video, Vorbis copied)
+# --------------------------------------------------------------------------- #
+def _filter_path(p):
+    """Escape a path so it is safe as a value inside an ffmpeg filtergraph."""
+    s = str(p)
+    for ch in ("\\", ":", "'", ",", ";", "[", "]"):
+        s = s.replace(ch, "\\" + ch)   # backslash is first in the list, so it is escaped once
+    return s
+
+
+def burn(src, ass, out, bitrate, crf, cpu_used, threads):
+    # The `ass` filter has no `charenc` option (that belongs to the `subtitles` filter).
+    # libass reads .ass as UTF-8 by default, which is exactly what we write, so none is needed.
+    vf = f"ass={_filter_path(ass)}"
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf,
+           "-c:v", "libvpx", "-b:v", bitrate]
+    if crf is not None:
+        cmd += ["-crf", str(crf)]
+    cmd += ["-deadline", "good", "-cpu-used", str(cpu_used), "-threads", str(threads),
+            "-c:a", "copy", str(out)]
+    run(cmd)
+
+
+# --------------------------------------------------------------------------- #
+#  Main
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description="Burn word-by-word Swedish captions into a vertical .webm")
+    ap.add_argument("input", type=Path, nargs="?", help="input .webm (already cropped to 9:16)")
+    ap.add_argument("-o", "--output", type=Path, help="output file (default: <name>_captioned.webm)")
+    ap.add_argument("-t", "--theme", default="classic", help="theme name from themes.toml")
+    ap.add_argument("--themes", help="path to a themes.toml (otherwise searched in standard spots)")
+    ap.add_argument("--ask-theme", action="store_true", help="choose a theme interactively")
+    ap.add_argument("--list-themes", action="store_true", help="list available themes and exit")
+    ap.add_argument("--no-review", action="store_true", help="skip the manual correction step")
+    ap.add_argument("--flag-below", type=float, default=FLAG_BELOW, help="confidence below which a word gets [?]")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="KB-Whisper model id")
+    ap.add_argument("--device", choices=["cpu", "cuda"], help="force device (default: auto)")
+    ap.add_argument("--compute-type", help="ctranslate2 compute type (default: int8 on CPU, float16 on GPU)")
+    ap.add_argument("--batch", type=int, default=16, help="WhisperX batch size")
+    ap.add_argument("--sensitive", action="store_true",
+                    help="catch softer/quieter speech (lower VAD + no-speech thresholds)")
+    ap.add_argument("--vad-onset", type=float, help="VAD onset threshold (default 0.5; lower catches fainter speech)")
+    ap.add_argument("--vad-offset", type=float, help="VAD offset threshold (default 0.363; lower catches fainter speech)")
+    ap.add_argument("--no-speech-threshold", type=float,
+                    help="Whisper no-speech cutoff (default 0.6; lower keeps more borderline-quiet audio)")
+    ap.add_argument("--bitrate", default="4M", help="VP8 target video bitrate")
+    ap.add_argument("--crf", type=int, help="VP8 quality (lower = better); pairs with --bitrate as a cap")
+    ap.add_argument("--cpu-used", type=int, default=2, help="libvpx speed 0..5 (higher = faster, lower quality)")
+    ap.add_argument("--threads", type=int, default=0, help="encoder threads (0 = auto)")
+    ap.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "caption-models",
+                    help="where to cache the downloaded models")
+    ap.add_argument("--keep-temp", action="store_true", help="keep the .wav/.json/.ass next to the output")
+    ap.add_argument("--no-bootstrap", action="store_true",
+                    help="don't auto-install WhisperX/torch; just print how to do it")
+    ap.add_argument("--gpu", action="store_true",
+                    help="during setup, keep the CUDA build of torch (default installs CPU build)")
+    ap.add_argument("-y", "--yes", action="store_true", help="don't ask before the first-time install")
+    args = ap.parse_args()
+
+    if args.list_themes:
+        themes = load_themes(args.themes)
+        print("Available themes:")
+        for name in sorted(themes):
+            t = resolve_theme(themes, name)
+            print(f"  {name:14s} {t['animation']:5s}  {t['words_per_line']} word/line  "
+                  f"accent {t['accent_colour']}  {t['position']}")
+        return
+
+    if args.input is None:
+        ap.error("an input file is required (or use --list-themes)")
+
+    if not args.input.is_file():
+        die(f"input not found: {args.input}")
+    # make sure the ML stack is present (bootstraps a venv and re-execs if needed)
+    ensure_deps(args.no_bootstrap, args.gpu, args.yes)
+    need("ffmpeg")
+
+    themes = load_themes(args.themes)
+    if args.ask_theme:
+        names = sorted(themes)
+        print("Available themes:")
+        for n, name in enumerate(names, 1):
+            print(f"  {n}) {name}")
+        choice = input("Choose a theme [1]: ").strip() or "1"
+        try:
+            args.theme = names[int(choice) - 1]
+        except (ValueError, IndexError):
+            if choice in themes:
+                args.theme = choice
+            else:
+                die(f"not a valid choice: {choice}")
+    theme = resolve_theme(themes, args.theme)
+    print(f"Theme: {args.theme}  ({theme['animation']}, {theme['words_per_line']} word/line, {theme['position']})")
+
+    args.cache.mkdir(parents=True, exist_ok=True)
+    stem = args.input.with_suffix("")
+    wav = stem.with_suffix(".wav")
+    ass = stem.with_suffix(".ass")
+    out = args.output or Path(f"{stem}_captioned.webm")
+
+    import torch
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    compute = args.compute_type or ("float16" if device == "cuda" else "int8")
+    print(f"Device: {device} ({compute})")
+
+    # Layer 1: build the VAD/ASR sensitivity overrides (defaults untouched unless asked)
+    vad_options, asr_options = {}, {}
+    if args.sensitive:
+        vad_options.update(vad_onset=0.3, vad_offset=0.2)
+        asr_options.update(no_speech_threshold=0.4)
+    if args.vad_onset is not None:
+        vad_options["vad_onset"] = args.vad_onset
+    if args.vad_offset is not None:
+        vad_options["vad_offset"] = args.vad_offset
+    if args.no_speech_threshold is not None:
+        asr_options["no_speech_threshold"] = args.no_speech_threshold
+    if vad_options or asr_options:
+        print(f"Sensitivity: vad={vad_options or 'default'}, asr={asr_options or 'default'}")
+
+    extract_audio(args.input, wav)
+    segments, model_a, metadata, audio = transcribe(
+        wav, args.model, device, compute, args.batch, args.cache,
+        vad_options or None, asr_options or None)
+    duration = len(audio) / 16000.0               # WhisperX audio is 16 kHz mono
+    orig_words = write_transcript(segments, stem.with_suffix(".txt"), args.flag_below)
+
+    if args.no_review:
+        entries = [{"kind": "existing", "idx": i, "tokens": [w["word"] for w in ws]}
+                   for i, ws in enumerate(orig_words)]
+        print("      Review skipped (--no-review).")
+    else:
+        open_editor(stem.with_suffix(".txt"))
+        entries = read_transcript(stem.with_suffix(".txt"))
+
+    retimed = retime(segments, orig_words, entries, model_a, metadata, audio, device, duration)
+    n_events = build_ass(retimed, theme, ass)
+    print(f"      {n_events} caption events written.")
+
+    burn(args.input, ass, out, args.bitrate, args.crf, args.cpu_used, args.threads)
+
+    if not args.keep_temp:
+        for f in (wav, ass, stem.with_suffix(".txt"), stem.with_suffix(".json")):
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+
+    print(f"\nDone  ->  {out}")
+
+
+if __name__ == "__main__":
+    main()
