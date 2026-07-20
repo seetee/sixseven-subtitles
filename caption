@@ -232,10 +232,11 @@ def find_themes_file(explicit):
     candidates = []
     if explicit:
         candidates.append(Path(explicit))
+    # Deliberately no cwd entry: a themes.toml you didn't write shouldn't be picked up
+    # just because of where you ran the command. Point at one with --themes instead.
     candidates += [
         Path.home() / ".config" / "caption" / "themes.toml",
         Path(__file__).resolve().parent / "themes.toml",
-        Path.cwd() / "themes.toml",
     ]
     for p in candidates:
         if p.is_file():
@@ -255,11 +256,42 @@ def load_themes(explicit):
     return data
 
 
+_HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_INT_KEYS = ("font_size", "outline_width", "shadow", "margin_h", "wrap",
+             "words_per_line", "play_w", "play_h")
+
+
 def resolve_theme(themes, name):
+    """Merge a theme over the defaults, rejecting anything build_ass can't render."""
     if name not in themes:
         die(f"theme '{name}' not found. Available: {', '.join(sorted(themes))}")
+    bad = f"theme '{name}':"
+    unknown = set(themes[name]) - set(THEME_DEFAULTS)
+    if unknown:
+        die(f"{bad} unknown key(s) {', '.join(sorted(unknown))}. "
+            f"Known keys: {', '.join(sorted(THEME_DEFAULTS))}")
+
     merged = dict(THEME_DEFAULTS)
     merged.update(themes[name])          # override only what the theme sets
+
+    if merged["position"] not in POSITION:
+        die(f"{bad} position must be one of {', '.join(POSITION)} (got {merged['position']!r})")
+    if merged["animation"] not in ("pop", "sweep"):
+        die(f"{bad} animation must be 'pop' or 'sweep' (got {merged['animation']!r})")
+    for key in ("base_colour", "accent_colour", "outline"):
+        if not _HEX.match(str(merged[key])):
+            die(f"{bad} {key} must be #RRGGBB (got {merged[key]!r})")
+    for key in _INT_KEYS:
+        if not isinstance(merged[key], int) or isinstance(merged[key], bool):
+            die(f"{bad} {key} must be a whole number (got {merged[key]!r})")
+    if merged["words_per_line"] < 1:
+        die(f"{bad} words_per_line must be at least 1")
+    if merged["margin_v"] is not None and not isinstance(merged["margin_v"], int):
+        die(f"{bad} margin_v must be a whole number, or left out for the default")
+    if not isinstance(merged["pop_scale"], (int, float)):
+        die(f"{bad} pop_scale must be a number (got {merged['pop_scale']!r})")
+    if not isinstance(merged["bold"], bool):
+        die(f"{bad} bold must be true or false (got {merged['bold']!r})")
     return merged
 
 
