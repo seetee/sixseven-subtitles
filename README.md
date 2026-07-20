@@ -17,7 +17,8 @@ webm in
   → you fix words in $EDITOR / Kate           ← the one pause
   → re-time                                   (unchanged lines keep timing; edited lines re-align)
   → build a themed ASS file                   (themes.toml)
-  → burn it in                                (ffmpeg, VP8 video, Vorbis copied through)
+  → burn it in                                (ffmpeg, VP9 video, Vorbis copied through)
+  → leave a .srt and a .json beside the output
 ```
 
 The pause is by design: a step that lets you correct words cannot also be unattended. On
@@ -27,12 +28,12 @@ KDE the packaging is still one click — right-click → *Captions* → *Add cap
 
 ## Requirements
 
-- **ffmpeg** built with `libvpx` (VP8) and `libass` (subtitle burn-in). Check:
+- **ffmpeg** built with `libvpx` (VP8/VP9) and `libass` (subtitle burn-in). Check:
   ```
-  ffmpeg -hide_banner -encoders | grep -w libvpx     # VP8 encoder present
-  ffmpeg -hide_banner -filters  | grep -w ass        # ass filter present
+  ffmpeg -hide_banner -encoders | grep -w libvpx-vp9  # VP9 encoder present (the default)
+  ffmpeg -hide_banner -filters  | grep -w ass         # ass filter present
   ```
-- **Python 3.11+** (uses the stdlib `tomllib`; falls back to `tomli` on older Pythons).
+- **Python 3.11+** (uses the stdlib `tomllib`).
 - **python3-venv** for the first-run bootstrap. On Debian/Ubuntu: `sudo apt install python3-venv`.
 
 You do **not** need to install WhisperX or PyTorch yourself. On first run the tool builds a
@@ -49,7 +50,7 @@ download on the first transcription to `~/.cache/caption-models` — a few GB, o
 ## Install
 
 ```bash
-# 1. the tool  (the service menu expects it here)
+# 1. the tool  (anywhere on $PATH; the service menu resolves it by name)
 install -Dm755 caption ~/.local/bin/caption
 
 # 2. themes
@@ -63,12 +64,15 @@ kbuildsycoca6                       # refresh menus, then reopen Dolphin
 `chmod +x` on the `.desktop` file is **required** on Plasma 6 — an un-executable service
 menu is ignored. `install -Dm755` above already sets that bit.
 
-The `.desktop` file hard-codes `/home/kenneth/.local/bin/caption`. If your home path differs,
-edit the two `Exec=` lines (or point them at `caption` alone, which resolves via `$PATH`).
+The `.desktop` file calls `caption` through `$PATH`, so the three commands above are the
+whole install on any machine. If your desktop session doesn't have `~/.local/bin` on `$PATH`,
+put an absolute path in the two `Exec=` lines instead.
 
 `themes.toml` is searched for in this order: the path given to `--themes`, then
-`~/.config/caption/themes.toml`, then next to the `caption` script, then the current
-directory. With none found, a built-in `classic` theme is used.
+`~/.config/caption/themes.toml`, then next to the `caption` script. With none found, a
+built-in `classic` theme is used. The current directory is deliberately *not* searched — a
+`themes.toml` you didn't write shouldn't take effect just because of where you ran the
+command; pass it explicitly with `--themes` if that's what you want.
 
 ---
 
@@ -83,6 +87,9 @@ caption clip.webm --ask-theme        # pick a theme interactively
 caption clip.webm --sensitive        # catch softer/quieter speech the recogniser tends to drop
 caption clip.webm --no-review        # fully unattended (skip the correction step)
 caption --list-themes                # show the themes and their settings
+
+# try another look without transcribing again — seconds instead of minutes
+caption clip.webm -t mint --from clip_captioned.json
 ```
 
 If quiet speech is being missed, `--sensitive` lowers the voice-detection and no-speech
@@ -123,6 +130,35 @@ word stranded on its own row, and wrapped to stay inside the frame if they'd be 
 
 ---
 
+## What you get
+
+Three files land next to the output:
+
+| File | What it's for |
+|---|---|
+| `clip_captioned.webm` | the clip with the captions burnt in |
+| `clip_captioned.srt` | the same captions as a subtitle track — selectable, searchable, translatable, and readable by a screen reader, none of which burnt-in text can be |
+| `clip_captioned.json` | the word timings, so you can re-theme without transcribing again |
+
+Burnt-in captions can't be turned off, resized, or read out. Upload the `.srt` alongside the
+video anywhere that accepts a subtitle track and the captions work for people who need them
+adjustable.
+
+The `.json` is the input to `--from`:
+
+```bash
+caption clip.webm -t sweep --from clip_captioned.json
+```
+
+That skips audio extraction, transcription, the correction step and re-timing, and goes
+straight to building and burning — so trying a different theme costs an encode, not a
+transcription. It doesn't need WhisperX or PyTorch installed at all, only `ffmpeg`. The
+corrections you made in the editor are already baked into the timings, so you don't redo them.
+
+Add `--keep-temp` to also keep the intermediate `.wav`, `.ass` and edited `.txt`.
+
+---
+
 ## Themes
 
 A theme sets colour, position, words-per-line and the animation. It only lists what differs
@@ -158,11 +194,24 @@ margin in pixels — raise it if wide words still crowd the edges.
 
 ---
 
-## Encoding knobs (VP8)
+## Encoding knobs
 
-Defaults: `--bitrate 4M`, `--cpu-used 2` (libvpx speed 0–5, higher = faster/rougher),
-`--threads 0` (auto). Add `--crf N` for constant-quality with the bitrate as a ceiling.
-The audio track is copied through untouched (`-c:a copy`), so only the video is re-encoded.
+Defaults: `--codec vp9`, `--bitrate 4M`, `--cpu-used 2` (libvpx speed 0–5, higher =
+faster/rougher), `--threads 0` (auto). Add `--crf N` for constant-quality with the bitrate as
+a ceiling. The audio track is copied through untouched (`-c:a copy`), so only the video is
+re-encoded.
+
+VP9 is the default because VP8 encodes on roughly one core no matter what `--threads` says.
+Measured on a 35 s 1080×1920 clip on 16 cores, same target bitrate, same output size:
+
+| | encode time |
+|---|---|
+| VP8 (the old default) | 188 s |
+| **VP9 `--cpu-used 2`** | **73 s** |
+| VP9 `--cpu-used 4` | 57 s |
+
+Either way the output is webm with the Vorbis track copied through, which every current
+browser plays. `--codec vp8` is still there if something downstream insists on it.
 
 ---
 
@@ -191,11 +240,14 @@ isn't used (WhisperX passes audio in-memory), so the run continues. To silence i
 
 ## Honest caveats
 
-- **Burning re-encodes the video**, and VP8 is not fast. That is the price of a `.webm` out
-  that matches your existing Kdenlive/Vorbis workflow. If you ever don't need webm, H.264/mp4
-  encodes several times faster and the platforms re-compress the upload anyway.
-- **Changing the theme re-runs transcription** — there is no cached-transcript reuse. Pick the
-  theme up front with `-t` or `--ask-theme` to avoid transcribing twice.
+- **Burning re-encodes the video**, and that is the slowest step by a distance — roughly 73 s
+  of a 90 s run on a 35 s clip, against 15 s for the transcription. It is the price of a
+  `.webm` out that matches your existing Kdenlive/Vorbis workflow. If you ever don't need
+  webm, H.264/mp4 encodes faster still and the platforms re-compress the upload anyway.
+- **A GPU barely helps.** CUDA accelerates transcription and alignment only, which is the
+  small end of the run; on a 35 s clip it saves on the order of ten seconds. The encode is
+  CPU-bound either way. `--device cuda` works if you have a CUDA torch installed, but don't
+  install one expecting a big win.
 - **Added rows are placed by forced alignment**, which assigns every word you type a time. A
   word that was genuinely spoken (just too quietly to be caught) lands in the right place; a
   word that *isn't* in the audio at all gets forced in somewhere anyway. Add what was said, in
@@ -204,9 +256,15 @@ isn't used (WhisperX passes audio in-memory), so the run continues. To silence i
   sizes assume vertical.
 - **Swedish by design** (KB-Whisper + the VoxRex aligner). Another language would need
   different models.
-- This was assembled in a sandbox without network access to the ML stack, so the end-to-end
-  transcribe→burn run could not be exercised there. The pure-Python logic (colour conversion,
-  timestamp formatting, transcript round-trip, re-timing, ASS generation) is unit-tested, and
-  the WhisperX/ffmpeg calls follow the official KBLab KB-Whisper recipe and the FFmpeg
-  libass/libvpx documentation. Do a first run on a short clip to confirm the models fetch and
-  the encode completes on your machine.
+- The pure-Python logic (colour conversion, timestamp formatting, line splitting, ASS
+  escaping, theme validation, transcript round-trip, re-timing, the `.srt` and `--from`
+  sidecars) is covered by `test_caption.py` — plain asserts, no framework, no ML deps:
+
+  ```bash
+  python3 test_caption.py
+  ```
+
+  The `--from` path is exercisable end to end with only `ffmpeg` installed. The full
+  transcribe→burn run needs the ML stack, so the WhisperX calls follow the official KBLab
+  KB-Whisper recipe and the ffmpeg calls the FFmpeg libass/libvpx documentation. Do a first
+  run on a short clip to confirm the models fetch and the encode completes on your machine.

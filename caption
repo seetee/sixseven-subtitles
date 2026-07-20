@@ -11,34 +11,35 @@ Flow:
       -> re-time: keep timings if a line's word count is unchanged,
          otherwise re-align just that line against the audio
       -> build a themed ASS file                        (themes.toml)
-      -> burn it into the .webm                         (ffmpeg, VP8 / copy Vorbis)
+      -> burn it into the .webm                         (ffmpeg, VP9 / copy Vorbis)
+      -> leave a .srt and a .json of the word timings next to the output
 
 Usage:
     caption clip.webm                       # classic theme, with review step
     caption clip.webm --theme cyan-centre
     caption clip.webm --no-review           # fully unattended
     caption clip.webm --ask-theme           # pick a theme interactively (used by the menu)
+    caption clip.webm --theme mint --from clip_captioned.json    # re-theme, seconds not minutes
 
 Only the standard library is imported at the top, so the file loads without the heavy
 ML deps present; torch / whisperx are imported lazily, inside the functions that need them.
 """
 
 import argparse
+import functools
 import gc
 import importlib.util
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 from pathlib import Path
-
-try:
-    import tomllib                       # Python 3.11+
-except ModuleNotFoundError:              # older Python: pip install tomli
-    import tomli as tomllib
 
 # --------------------------------------------------------------------------- #
 #  Defaults
@@ -99,6 +100,11 @@ def run(cmd, quiet=False):
     if not quiet:
         print("  $", " ".join(shlex.quote(c) for c in cmd))
     subprocess.run(cmd, check=True)
+
+
+def ass_text(s):
+    """Escape caption text so it can't be read as ASS override tags."""
+    return s.replace("\\", "⧵").replace("{", "\\{").replace("}", "\\}")
 
 
 def hex_to_ass(h, alpha="00"):
@@ -231,10 +237,11 @@ def find_themes_file(explicit):
     candidates = []
     if explicit:
         candidates.append(Path(explicit))
+    # Deliberately no cwd entry: a themes.toml you didn't write shouldn't be picked up
+    # just because of where you ran the command. Point at one with --themes instead.
     candidates += [
         Path.home() / ".config" / "caption" / "themes.toml",
         Path(__file__).resolve().parent / "themes.toml",
-        Path.cwd() / "themes.toml",
     ]
     for p in candidates:
         if p.is_file():
@@ -254,11 +261,42 @@ def load_themes(explicit):
     return data
 
 
+_HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_INT_KEYS = ("font_size", "outline_width", "shadow", "margin_h", "wrap",
+             "words_per_line", "play_w", "play_h")
+
+
 def resolve_theme(themes, name):
+    """Merge a theme over the defaults, rejecting anything build_ass can't render."""
     if name not in themes:
         die(f"theme '{name}' not found. Available: {', '.join(sorted(themes))}")
+    bad = f"theme '{name}':"
+    unknown = set(themes[name]) - set(THEME_DEFAULTS)
+    if unknown:
+        die(f"{bad} unknown key(s) {', '.join(sorted(unknown))}. "
+            f"Known keys: {', '.join(sorted(THEME_DEFAULTS))}")
+
     merged = dict(THEME_DEFAULTS)
     merged.update(themes[name])          # override only what the theme sets
+
+    if merged["position"] not in POSITION:
+        die(f"{bad} position must be one of {', '.join(POSITION)} (got {merged['position']!r})")
+    if merged["animation"] not in ("pop", "sweep"):
+        die(f"{bad} animation must be 'pop' or 'sweep' (got {merged['animation']!r})")
+    for key in ("base_colour", "accent_colour", "outline"):
+        if not _HEX.match(str(merged[key])):
+            die(f"{bad} {key} must be #RRGGBB (got {merged[key]!r})")
+    for key in _INT_KEYS:
+        if not isinstance(merged[key], int) or isinstance(merged[key], bool):
+            die(f"{bad} {key} must be a whole number (got {merged[key]!r})")
+    if merged["words_per_line"] < 1:
+        die(f"{bad} words_per_line must be at least 1")
+    if merged["margin_v"] is not None and not isinstance(merged["margin_v"], int):
+        die(f"{bad} margin_v must be a whole number, or left out for the default")
+    if not isinstance(merged["pop_scale"], (int, float)):
+        die(f"{bad} pop_scale must be a number (got {merged['pop_scale']!r})")
+    if not isinstance(merged["bold"], bool):
+        die(f"{bad} bold must be true or false (got {merged['bold']!r})")
     return merged
 
 
@@ -273,9 +311,29 @@ def extract_audio(src, wav):
 # --------------------------------------------------------------------------- #
 #  Step 2 — transcribe + align
 # --------------------------------------------------------------------------- #
+@functools.lru_cache(maxsize=1)
+def load_aligner(device, cache):
+    """The phoneme aligner, loaded once and kept. Cached rather than passed around so
+    that release_aligner() can drop it during the review pause and a later re-time can
+    bring it back only if some line actually changed."""
+    import whisperx
+    return whisperx.load_align_model(language_code=LANG, device=device,
+                                     model_name=ALIGN_MODEL, model_dir=cache)
+
+
+def release_aligner(device):
+    """Drop the aligner from memory. It's ~1 GB and does nothing while you edit."""
+    load_aligner.cache_clear()
+    gc.collect()
+    if device == "cuda":
+        import torch
+        torch.cuda.empty_cache()
+
+
 def transcribe(wav, model_name, device, compute_type, batch, cache,
                vad_options=None, asr_options=None):
-    """Return (segments, align_model, metadata, audio). Frees the ASR model afterwards."""
+    """Return (segments, audio). Frees the ASR model afterwards; the aligner is left in
+    load_aligner's cache for the caller to keep or release."""
     print("[2/5] Transcribing and aligning Swedish (first run downloads the models)…")
     import torch                          # noqa: F401  (lazy)
     import whisperx
@@ -289,34 +347,33 @@ def transcribe(wav, model_name, device, compute_type, batch, cache,
     audio = whisperx.load_audio(str(wav))
     result = asr.transcribe(audio, batch_size=batch, language=LANG)
 
-    model_a, metadata = whisperx.load_align_model(
-        language_code=LANG, device=device, model_name=ALIGN_MODEL, model_dir=str(cache))
+    model_a, metadata = load_aligner(device, str(cache))
     aligned = whisperx.align(result["segments"], model_a, metadata, audio, device,
                              return_char_alignments=False)
 
-    # the big ASR model is no longer needed while you edit
+    # the big ASR model is no longer needed once the words are placed
     del asr
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    return aligned["segments"], model_a, metadata, audio
+    return aligned["segments"], audio
 
 
-def realign_text(text, start, end, model_a, metadata, audio, device):
+def realign_text(text, start, end, audio, device, cache):
     """Re-align a single corrected line against the audio; return its word list."""
     import whisperx
+    model_a, metadata = load_aligner(device, cache)
     seg = {"start": float(start), "end": float(end), "text": text}
     out = whisperx.align([seg], model_a, metadata, audio, device,
                          return_char_alignments=False)
     return out["segments"][0].get("words", [])
 
 
-def realign_within(tokens, start, end, model_a, metadata, audio, device):
+def realign_within(tokens, start, end, audio, device, cache):
     """Align a row's words inside [start, end]; fall back to an even spread if alignment
     returns nothing (e.g. speech too faint for the aligner to place)."""
-    words = clean_words(realign_text(" ".join(tokens), start, end,
-                                     model_a, metadata, audio, device))
+    words = clean_words(realign_text(" ".join(tokens), start, end, audio, device, cache))
     if not words:
         span = max(0.01, (end - start)) / max(1, len(tokens))
         words = [{"word": t, "start": start + k * span, "end": start + (k + 1) * span}
@@ -385,7 +442,11 @@ def open_editor(path):
     print(f"      Opening '{base}' — edit the words, then save and close.")
     before = path.stat().st_mtime
     t0 = time.time()
-    subprocess.run(argv + [str(path)])
+    try:
+        subprocess.run(argv + [str(path)])
+    except FileNotFoundError:
+        die(f"editor {argv[0]!r} not found. Set $VISUAL or $EDITOR to one you have "
+            "installed, or run with --no-review to skip the correction step.")
     # Safety net for a GUI editor that forked and returned at once:
     if time.time() - t0 < 1.5 and path.stat().st_mtime == before:
         try:
@@ -427,7 +488,7 @@ def read_transcript(path):
 # --------------------------------------------------------------------------- #
 #  Re-time after editing
 # --------------------------------------------------------------------------- #
-def retime(orig_segments, orig_words, entries, model_a, metadata, audio, device, duration):
+def retime(orig_segments, orig_words, entries, audio, device, cache, duration):
     """Turn the edited rows into per-row word lists with timings.
 
     * an unchanged existing row keeps its exact word timings;
@@ -481,7 +542,7 @@ def retime(orig_segments, orig_words, entries, model_a, metadata, audio, device,
             realigned += 1
         else:
             added += 1
-        rows.append(realign_within(tokens, w[0], w[1], model_a, metadata, audio, device))
+        rows.append(realign_within(tokens, w[0], w[1], audio, device, cache))
 
     print(f"      {realigned} changed line(s) re-aligned, {added} new line(s) placed; "
           "the rest kept their timing.")
@@ -491,11 +552,6 @@ def retime(orig_segments, orig_words, entries, model_a, metadata, audio, device,
 # --------------------------------------------------------------------------- #
 #  Step 5a — build the themed ASS
 # --------------------------------------------------------------------------- #
-def chunk(words, n):
-    for i in range(0, len(words), n):
-        yield words[i:i + n]
-
-
 def split_even(words, target):
     """Split a word list into near-equal rows of at most `target` words, avoiding a
     lone trailing word: 7 words at target 3 -> [3, 2, 2], not [3, 3, 1]."""
@@ -564,7 +620,7 @@ def build_ass(segments_words, theme, path):
                 for j, w in enumerate(line):
                     nxt = line[j + 1]["start"] if j + 1 < len(line) else l_end
                     cs = max(1, int(round((nxt - w["start"]) * 100)))
-                    parts.append(f"{{\\kf{cs}}}{w['word']}")
+                    parts.append(f"{{\\kf{cs}}}{ass_text(w['word'])}")
                 events.append(f"Dialogue: 0,{ts(l_start)},{ts(l_end)},Cap,,0,0,0,,{' '.join(parts)}")
             else:
                 # one event per active word; that word is recoloured (and optionally enlarged)
@@ -576,13 +632,59 @@ def build_ass(segments_words, theme, path):
                     chips = []
                     for k, ww in enumerate(line):
                         if k == j:
-                            chips.append(f"{{\\c{accent}&{pop}}}{ww['word']}{{\\r}}")
+                            chips.append(f"{{\\c{accent}&{pop}}}{ass_text(ww['word'])}{{\\r}}")
                         else:
-                            chips.append(ww["word"])
+                            chips.append(ass_text(ww["word"]))
                     events.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,{' '.join(chips)}")
 
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return len(events)
+
+
+# --------------------------------------------------------------------------- #
+#  Sidecars — the word timings, and a subtitle file that isn't burnt in
+# --------------------------------------------------------------------------- #
+def save_words(segments_words, path):
+    """Save the re-timed words so a later run can skip straight to --from."""
+    path.write_text(json.dumps(segments_words, ensure_ascii=False), encoding="utf-8")
+
+
+def load_words(path):
+    """Read back a save_words file, checking it really is one."""
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(rows, list) or not rows:
+            raise TypeError("expected a non-empty list of caption rows")
+        return [[{"word": str(w["word"]), "start": float(w["start"]), "end": float(w["end"])}
+                 for w in row] for row in rows]
+    except OSError as e:
+        die(f"could not read {path}: {e}")
+    except (ValueError, TypeError, KeyError) as e:
+        die(f"{path} is not a caption timings file ({type(e).__name__}: {e})")
+
+
+def srt_ts(t):
+    """seconds -> HH:MM:SS,mmm  (SRT timestamp)."""
+    ms = int(round(max(0.0, t) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_srt(segments_words, theme, path):
+    """A plain subtitle file matching what gets burnt in — selectable, searchable,
+    readable by a screen reader, and translatable. Burnt-in text is none of those."""
+    cues = []
+    for words in segments_words:
+        for line in split_even(words, theme["words_per_line"]):
+            if line:
+                cues.append((line[0]["start"], line[-1]["end"],
+                             " ".join(w["word"] for w in line)))
+    path.write_text(
+        "".join(f"{i}\n{srt_ts(a)} --> {srt_ts(b)}\n{text}\n\n"
+                for i, (a, b, text) in enumerate(cues, 1)), encoding="utf-8")
+    return len(cues)
 
 
 # --------------------------------------------------------------------------- #
@@ -596,12 +698,19 @@ def _filter_path(p):
     return s
 
 
-def burn(src, ass, out, bitrate, crf, cpu_used, threads):
+def burn(src, ass, out, codec, bitrate, crf, cpu_used, threads):
     # The `ass` filter has no `charenc` option (that belongs to the `subtitles` filter).
     # libass reads .ass as UTF-8 by default, which is exactly what we write, so none is needed.
     vf = f"ass={_filter_path(ass)}"
-    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf,
-           "-c:v", "libvpx", "-b:v", bitrate]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf]
+    if codec == "vp8":
+        cmd += ["-c:v", "libvpx"]
+    else:
+        # VP8 encodes on essentially one core. VP9's row multithreading uses the rest:
+        # measured on a 35 s 1080x1920 clip, 16 cores, same target bitrate and output
+        # size, 188 s -> 73 s. Everything else about the webm is unchanged.
+        cmd += ["-c:v", "libvpx-vp9", "-row-mt", "1", "-tile-columns", "2"]
+    cmd += ["-b:v", bitrate]
     if crf is not None:
         cmd += ["-crf", str(crf)]
     cmd += ["-deadline", "good", "-cpu-used", str(cpu_used), "-threads", str(threads),
@@ -621,6 +730,9 @@ def main():
     ap.add_argument("--ask-theme", action="store_true", help="choose a theme interactively")
     ap.add_argument("--list-themes", action="store_true", help="list available themes and exit")
     ap.add_argument("--no-review", action="store_true", help="skip the manual correction step")
+    ap.add_argument("--from", dest="from_words", type=Path, metavar="WORDS.json",
+                    help="reuse saved word timings (written next to every output) and skip "
+                         "transcription entirely — the fast way to try another theme")
     ap.add_argument("--flag-below", type=float, default=FLAG_BELOW, help="confidence below which a word gets [?]")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="KB-Whisper model id")
     ap.add_argument("--device", choices=["cpu", "cuda"], help="force device (default: auto)")
@@ -632,13 +744,16 @@ def main():
     ap.add_argument("--vad-offset", type=float, help="VAD offset threshold (default 0.363; lower catches fainter speech)")
     ap.add_argument("--no-speech-threshold", type=float,
                     help="Whisper no-speech cutoff (default 0.6; lower keeps more borderline-quiet audio)")
-    ap.add_argument("--bitrate", default="4M", help="VP8 target video bitrate")
-    ap.add_argument("--crf", type=int, help="VP8 quality (lower = better); pairs with --bitrate as a cap")
+    ap.add_argument("--codec", choices=["vp9", "vp8"], default="vp9",
+                    help="video codec (default vp9: same webm, same size, ~3x faster than vp8)")
+    ap.add_argument("--bitrate", default="4M", help="target video bitrate")
+    ap.add_argument("--crf", type=int, help="quality (lower = better); pairs with --bitrate as a cap")
     ap.add_argument("--cpu-used", type=int, default=2, help="libvpx speed 0..5 (higher = faster, lower quality)")
     ap.add_argument("--threads", type=int, default=0, help="encoder threads (0 = auto)")
     ap.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "caption-models",
                     help="where to cache the downloaded models")
-    ap.add_argument("--keep-temp", action="store_true", help="keep the .wav/.json/.ass next to the output")
+    ap.add_argument("--keep-temp", action="store_true",
+                    help="copy the .wav/.ass/.txt next to the output instead of discarding them")
     ap.add_argument("--no-bootstrap", action="store_true",
                     help="don't auto-install WhisperX/torch; just print how to do it")
     ap.add_argument("--gpu", action="store_true",
@@ -660,9 +775,11 @@ def main():
 
     if not args.input.is_file():
         die(f"input not found: {args.input}")
-    # make sure the ML stack is present (bootstraps a venv and re-execs if needed)
-    ensure_deps(args.no_bootstrap, args.gpu, args.yes)
+    # before the multi-GB dependency download, not after
     need("ffmpeg")
+    # --from replays saved timings, so the whole ML stack is unnecessary for it
+    if not args.from_words:
+        ensure_deps(args.no_bootstrap, args.gpu, args.yes)
 
     themes = load_themes(args.themes)
     if args.ask_theme:
@@ -670,7 +787,10 @@ def main():
         print("Available themes:")
         for n, name in enumerate(names, 1):
             print(f"  {n}) {name}")
-        choice = input("Choose a theme [1]: ").strip() or "1"
+        try:
+            choice = input("Choose a theme [1]: ").strip() or "1"
+        except EOFError:
+            die("no theme chosen (no terminal to ask on). Use --theme NAME instead.")
         try:
             args.theme = names[int(choice) - 1]
         except (ValueError, IndexError):
@@ -682,60 +802,88 @@ def main():
     print(f"Theme: {args.theme}  ({theme['animation']}, {theme['words_per_line']} word/line, {theme['position']})")
 
     args.cache.mkdir(parents=True, exist_ok=True)
-    stem = args.input.with_suffix("")
-    wav = stem.with_suffix(".wav")
-    ass = stem.with_suffix(".ass")
-    out = args.output or Path(f"{stem}_captioned.webm")
+    out = args.output or Path(f"{args.input.with_suffix('')}_captioned.webm")
+    # Intermediates live in their own directory. Deriving them from the input's name
+    # (with_suffix) turned "my.video.webm" into "my.wav" and deleted whatever that was.
+    tmp = Path(tempfile.mkdtemp(prefix="caption-"))
+    wav, ass, txt = tmp / "audio.wav", tmp / "captions.ass", tmp / "transcript.txt"
 
-    import torch
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    compute = args.compute_type or ("float16" if device == "cuda" else "int8")
-    print(f"Device: {device} ({compute})")
+    try:
+        if args.from_words:
+            retimed = load_words(args.from_words)
+            print(f"Reusing the word timings in {args.from_words} — "
+                  f"{sum(len(r) for r in retimed)} words, nothing to transcribe.")
+        else:
+            import torch
+            device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            compute = args.compute_type or ("float16" if device == "cuda" else "int8")
+            print(f"Device: {device} ({compute})")
 
-    # Layer 1: build the VAD/ASR sensitivity overrides (defaults untouched unless asked)
-    vad_options, asr_options = {}, {}
-    if args.sensitive:
-        vad_options.update(vad_onset=0.3, vad_offset=0.2)
-        asr_options.update(no_speech_threshold=0.4)
-    if args.vad_onset is not None:
-        vad_options["vad_onset"] = args.vad_onset
-    if args.vad_offset is not None:
-        vad_options["vad_offset"] = args.vad_offset
-    if args.no_speech_threshold is not None:
-        asr_options["no_speech_threshold"] = args.no_speech_threshold
-    if vad_options or asr_options:
-        print(f"Sensitivity: vad={vad_options or 'default'}, asr={asr_options or 'default'}")
+            # build the VAD/ASR sensitivity overrides (defaults untouched unless asked)
+            vad_options, asr_options = {}, {}
+            if args.sensitive:
+                vad_options.update(vad_onset=0.3, vad_offset=0.2)
+                asr_options.update(no_speech_threshold=0.4)
+            if args.vad_onset is not None:
+                vad_options["vad_onset"] = args.vad_onset
+            if args.vad_offset is not None:
+                vad_options["vad_offset"] = args.vad_offset
+            if args.no_speech_threshold is not None:
+                asr_options["no_speech_threshold"] = args.no_speech_threshold
+            if vad_options or asr_options:
+                print(f"Sensitivity: vad={vad_options or 'default'}, asr={asr_options or 'default'}")
 
-    extract_audio(args.input, wav)
-    segments, model_a, metadata, audio = transcribe(
-        wav, args.model, device, compute, args.batch, args.cache,
-        vad_options or None, asr_options or None)
-    duration = len(audio) / 16000.0               # WhisperX audio is 16 kHz mono
-    orig_words = write_transcript(segments, stem.with_suffix(".txt"), args.flag_below)
+            extract_audio(args.input, wav)
+            segments, audio = transcribe(
+                wav, args.model, device, compute, args.batch, args.cache,
+                vad_options or None, asr_options or None)
+            duration = len(audio) / 16000.0           # WhisperX audio is 16 kHz mono
+            orig_words = write_transcript(segments, txt, args.flag_below)
 
-    if args.no_review:
-        entries = [{"kind": "existing", "idx": i, "tokens": [w["word"] for w in ws]}
-                   for i, ws in enumerate(orig_words)]
-        print("      Review skipped (--no-review).")
-    else:
-        open_editor(stem.with_suffix(".txt"))
-        entries = read_transcript(stem.with_suffix(".txt"))
+            if args.no_review:
+                entries = [{"kind": "existing", "idx": i, "tokens": [w["word"] for w in ws]}
+                           for i, ws in enumerate(orig_words)]
+                print("      Review skipped (--no-review).")
+            else:
+                # A review can take hours. Don't hold the aligner for all of it —
+                # retime reloads it only if a line actually needs re-aligning.
+                release_aligner(device)
+                open_editor(txt)
+                entries = read_transcript(txt)
 
-    retimed = retime(segments, orig_words, entries, model_a, metadata, audio, device, duration)
-    n_events = build_ass(retimed, theme, ass)
-    print(f"      {n_events} caption events written.")
+            retimed = retime(segments, orig_words, entries,
+                             audio, device, str(args.cache), duration)
+        n_events = build_ass(retimed, theme, ass)
+        print(f"      {n_events} caption events written.")
 
-    burn(args.input, ass, out, args.bitrate, args.crf, args.cpu_used, args.threads)
+        # Sidecars first: they cost minutes of transcription to produce and seconds to
+        # write, so don't risk losing them to a failed encode.
+        words_json, srt = out.with_suffix(".json"), out.with_suffix(".srt")
+        if not args.from_words or args.from_words.resolve() != words_json.resolve():
+            save_words(retimed, words_json)
+        n_cues = build_srt(retimed, theme, srt)
 
-    if not args.keep_temp:
-        for f in (wav, ass, stem.with_suffix(".txt"), stem.with_suffix(".json")):
-            try:
-                f.unlink()
-            except FileNotFoundError:
-                pass
+        burn(args.input, ass, out, args.codec, args.bitrate, args.crf,
+             args.cpu_used, args.threads)
+
+        if args.keep_temp:
+            for f in (wav, ass, txt):
+                if f.exists():                    # no .wav or transcript on the --from path
+                    shutil.copy2(f, out.with_name(out.stem + f.suffix))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     print(f"\nDone  ->  {out}")
+    print(f"         {srt}  ({n_cues} cues — a subtitle track viewers can turn off)")
+    print(f"         {words_json}  (re-theme instantly:  caption {args.input} "
+          f"--theme NAME --from {words_json})")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        die("interrupted.", 130)
+    except subprocess.CalledProcessError as e:
+        die(f"{Path(e.cmd[0]).name} failed (exit {e.returncode}). "
+            "Its output is above — that usually says why.")
