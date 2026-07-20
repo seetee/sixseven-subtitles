@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.11 is the documented floor (stdlib tomllib); 3.13 is current.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # No install step: test_caption.py and the module scope of `caption` are
+      # stdlib-only by design, so the suite runs without WhisperX, torch or ffmpeg.
+      - run: python3 test_caption.py

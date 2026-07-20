@@ -1,5 +1,6 @@
 # 67subtitles — word-by-word Swedish captions for vertical short-form video
 
+[![tests](https://img.shields.io/github/actions/workflow/status/seetee/sixseven-subtitles/tests.yml?branch=main&style=flat-square&label=tests)](https://github.com/seetee/sixseven-subtitles/actions/workflows/tests.yml)
 [![vibe coded](https://img.shields.io/badge/vibe_coded-%E2%9C%A8-ff69b4?style=flat-square)](https://en.wikipedia.org/wiki/Vibe_coding)
 [![coded with Claude](https://img.shields.io/badge/coded_with-Claude_Code-CC785C?style=flat-square&logo=anthropic)](https://claude.ai/code)
 [![license: AGPL v3](https://img.shields.io/badge/license-AGPL_v3-blue?style=flat-square)](LICENSE)

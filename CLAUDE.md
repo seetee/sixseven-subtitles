@@ -9,9 +9,13 @@ documents the user-facing contract.
 
 ## What this is
 
-`caption` is a single-file Python CLI that burns word-by-word Swedish captions into vertical
-(9:16) `.webm` clips. The whole tool is the `caption` script (~890 lines) plus `themes.toml`
-(look/animation presets), `add-captions.desktop` (a KDE Dolphin right-click service menu) and
+**67subtitles** (repo `sixseven-subtitles`) is a single-file Python CLI that burns
+word-by-word Swedish captions into vertical (9:16) `.webm` clips. The project is
+67subtitles; the executable it installs is called `caption`, which is the name used
+throughout this file and the README.
+
+The whole tool is the `caption` script (~890 lines) plus `themes.toml` (look/animation
+presets), `add-captions.desktop` (a KDE Dolphin right-click service menu) and
 `test_caption.py`. There is no package structure and no build step.
 
 Pipeline: extract 16 kHz mono audio (ffmpeg) → transcribe + word-align Swedish audio
@@ -40,6 +44,10 @@ python3 caption --help
 ASS escaping, every `resolve_theme` rejection, the transcript round-trip, `retime` (with the
 aligner stubbed), the aligner cache, and the `.srt`/`--from` sidecars. Add to it when you
 change any of those; it needs no ML stack and runs in under a second.
+
+CI (`.github/workflows/tests.yml`) runs that suite on Python 3.11 and 3.13 for every push to
+`main` and every PR. It installs nothing — keeping `test_caption.py` and the module scope of
+`caption` stdlib-only is what makes that possible, so don't add an import that breaks it.
 
 **The `--from` path is fully exercisable without WhisperX or torch** — it needs only ffmpeg.
 That makes it the way to test the real pipeline end to end while iterating:
