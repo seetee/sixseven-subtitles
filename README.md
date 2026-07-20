@@ -63,8 +63,10 @@ The `.desktop` file hard-codes `/home/kenneth/.local/bin/caption`. If your home 
 edit the two `Exec=` lines (or point them at `caption` alone, which resolves via `$PATH`).
 
 `themes.toml` is searched for in this order: the path given to `--themes`, then
-`~/.config/caption/themes.toml`, then next to the `caption` script, then the current
-directory. With none found, a built-in `classic` theme is used.
+`~/.config/caption/themes.toml`, then next to the `caption` script. With none found, a
+built-in `classic` theme is used. The current directory is deliberately *not* searched — a
+`themes.toml` you didn't write shouldn't take effect just because of where you ran the
+command; pass it explicitly with `--themes` if that's what you want.
 
 ---
 
@@ -79,6 +81,9 @@ caption clip.webm --ask-theme        # pick a theme interactively
 caption clip.webm --sensitive        # catch softer/quieter speech the recogniser tends to drop
 caption clip.webm --no-review        # fully unattended (skip the correction step)
 caption --list-themes                # show the themes and their settings
+
+# try another look without transcribing again — seconds instead of minutes
+caption clip.webm -t mint --from clip_captioned.json
 ```
 
 If quiet speech is being missed, `--sensitive` lowers the voice-detection and no-speech
@@ -116,6 +121,35 @@ what gets captioned.** Format:
 
 Longer lines are split into on-screen rows automatically, balanced so you never get a single
 word stranded on its own row, and wrapped to stay inside the frame if they'd be too wide.
+
+---
+
+## What you get
+
+Three files land next to the output:
+
+| File | What it's for |
+|---|---|
+| `clip_captioned.webm` | the clip with the captions burnt in |
+| `clip_captioned.srt` | the same captions as a subtitle track — selectable, searchable, translatable, and readable by a screen reader, none of which burnt-in text can be |
+| `clip_captioned.json` | the word timings, so you can re-theme without transcribing again |
+
+Burnt-in captions can't be turned off, resized, or read out. Upload the `.srt` alongside the
+video anywhere that accepts a subtitle track and the captions work for people who need them
+adjustable.
+
+The `.json` is the input to `--from`:
+
+```bash
+caption clip.webm -t sweep --from clip_captioned.json
+```
+
+That skips audio extraction, transcription, the correction step and re-timing, and goes
+straight to building and burning — so trying a different theme costs an encode, not a
+transcription. It doesn't need WhisperX or PyTorch installed at all, only `ffmpeg`. The
+corrections you made in the editor are already baked into the timings, so you don't redo them.
+
+Add `--keep-temp` to also keep the intermediate `.wav`, `.ass` and edited `.txt`.
 
 ---
 
@@ -200,9 +234,15 @@ isn't used (WhisperX passes audio in-memory), so the run continues. To silence i
   sizes assume vertical.
 - **Swedish by design** (KB-Whisper + the VoxRex aligner). Another language would need
   different models.
-- This was assembled in a sandbox without network access to the ML stack, so the end-to-end
-  transcribe→burn run could not be exercised there. The pure-Python logic (colour conversion,
-  timestamp formatting, transcript round-trip, re-timing, ASS generation) is unit-tested, and
-  the WhisperX/ffmpeg calls follow the official KBLab KB-Whisper recipe and the FFmpeg
-  libass/libvpx documentation. Do a first run on a short clip to confirm the models fetch and
-  the encode completes on your machine.
+- The pure-Python logic (colour conversion, timestamp formatting, line splitting, ASS
+  escaping, theme validation, transcript round-trip, re-timing, the `.srt` and `--from`
+  sidecars) is covered by `test_caption.py` — plain asserts, no framework, no ML deps:
+
+  ```bash
+  python3 test_caption.py
+  ```
+
+  The `--from` path is exercisable end to end with only `ffmpeg` installed. The full
+  transcribe→burn run needs the ML stack, so the WhisperX calls follow the official KBLab
+  KB-Whisper recipe and the ffmpeg calls the FFmpeg libass/libvpx documentation. Do a first
+  run on a short clip to confirm the models fetch and the encode completes on your machine.
