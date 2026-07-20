@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+
+# local Claude Code settings (also in the global ignore; repeated so a fresh
+# clone on another machine behaves the same without one)
+.claude/settings.local.json
+
+# caption's own output, if you test on a clip inside the repo
+*_captioned.*
