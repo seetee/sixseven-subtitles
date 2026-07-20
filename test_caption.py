@@ -5,6 +5,7 @@ No framework — plain asserts. Covers the bits that silently produce wrong capt
 rather than crashing: colour conversion, timestamps, line splitting, ASS escaping,
 theme validation and the transcript round-trip.
 """
+import importlib.machinery      # not implied by importlib.util outside 3.12
 import importlib.util
 import sys
 from pathlib import Path
