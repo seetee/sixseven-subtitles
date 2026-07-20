@@ -104,6 +104,13 @@ Key sections, in the order execution actually flows through `main()`:
   `main` can `release_aligner()` before the editor opens — the review pause is unbounded and
   the model is ~1 GB. `retime` asks for it through the same cache, so it is reloaded only if
   a line actually needs re-aligning.
+- **Transcript granularity** (`split_segments`): WhisperX segments are written to the
+  transcript one per line, but a raw segment can run 20 s and swallow a long silence. Then
+  there is no line boundary at the pause, so a missed sentence can only be added *after* the
+  segment and `retime` places it in the following gap — an added line landed 11 s from where
+  it was spoken. `split_segments` breaks segments at `PAUSE` first, so every line is one
+  speech burst with a tight window. Don't remove it: the transcript's usefulness for
+  correction depends on its line boundaries matching the speech.
 - **Transcript round-trip** (`write_transcript`, `read_transcript`, `clean_words`): the
   editable transcript format is `NNNN | word word [?]word …`. `read_transcript` parses it
   back into `{"kind": "existing"|"new", "idx"?, "tokens"}` entries — this is the contract
@@ -112,6 +119,13 @@ Key sections, in the order execution actually flows through `main()`:
   line with a leading `+`) gets re-aligned. Get this parsing/round-trip logic right first if
   changing the transcript format — it's the one interactive step in an otherwise unattended
   pipeline.
+- **Explicit timing** (`parse_at`, `spread`): an added line may start with `@12.5` or
+  `@12.5-14`, and that window is used verbatim with the words spread evenly — the aligner is
+  not consulted. This exists because forced alignment cannot place speech it cannot hear:
+  measured on a real clip with dialogue under game audio, an added phrase was collapsed to
+  the first 0.4 s of a 10 s gap, and giving it neighbouring rows as anchors made it *worse*
+  (anchor words known to be at 17.8 s were placed at 8.1 s). Don't replace this with a
+  cleverer alignment heuristic without measuring on that kind of audio first.
 - **Re-timing** (`retime`): assigns a time window to every row (existing rows use their
   original segment window; runs of new rows subdivide the gap between their nearest timed
   neighbours), then only re-runs alignment for rows that actually changed or were added.

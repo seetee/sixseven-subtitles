@@ -44,7 +44,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 #  Defaults
 # --------------------------------------------------------------------------- #
-VERSION       = "1.0.3"
+VERSION       = "1.1.0"
 DEFAULT_MODEL = "KBLab/kb-whisper-small"
 ALIGN_MODEL   = "KBLab/wav2vec2-large-voxrex-swedish"
 LANG          = "sv"
@@ -408,6 +408,13 @@ def realign_text(text, start, end, audio, device, cache):
     return out["segments"][0].get("words", [])
 
 
+def spread(tokens, start, end):
+    """Lay words evenly across a window. Used when the time came from you, not the aligner."""
+    span = max(0.01, end - start) / max(1, len(tokens))
+    return [{"word": t, "start": start + k * span, "end": start + (k + 1) * span}
+            for k, t in enumerate(tokens)]
+
+
 def realign_within(tokens, start, end, audio, device, cache):
     """Align a row's words inside [start, end]; fall back to an even spread if alignment
     returns nothing (e.g. speech too faint for the aligner to place)."""
@@ -437,6 +444,31 @@ def clean_words(raw_words):
     return out
 
 
+def split_segments(segments, pause=PAUSE):
+    """One transcript line per speech burst, rather than per WhisperX segment.
+
+    WhisperX segments are coarse — an observed one ran 2.95s to 23.01s and swallowed a
+    ten-second silence. That makes the transcript unusable for correction: with no line
+    boundary at the pause, a sentence the recogniser missed can only be added *after* the
+    whole segment, so `retime` places it in the gap that follows and it lands eleven
+    seconds from where it was spoken. Splitting at pauses gives every burst its own line
+    and its own tight window, so an added line is timed where the silence actually is.
+    """
+    bursts = []
+    for seg in segments:
+        words = clean_words(seg.get("words", []))
+        if not words:
+            continue
+        burst = [words[0]]
+        for w in words[1:]:
+            if w["start"] - burst[-1]["end"] > pause:
+                bursts.append(burst)
+                burst = []
+            burst.append(w)
+        bursts.append(burst)
+    return [{"start": b[0]["start"], "end": b[-1]["end"], "words": b} for b in bursts]
+
+
 def write_transcript(segments, path, flag_below):
     """Write an editable transcript; return the cleaned per-segment word lists."""
     print("Writing the transcript for review…")
@@ -449,6 +481,12 @@ def write_transcript(segments, path, flag_below):
         "#   * Edit the words on a line freely (fix spelling, change the whole line).",
         "#   * ADD a line the recogniser missed: write it on its own line, in reading",
         "#     order, e.g.   + de här orden var för tysta   (the leading + is optional).",
+        "#     It gets timed by matching it to the audio. If the speech is buried under",
+        "#     music or game sound the aligner can't hear it and will guess badly — say",
+        "#     when it is spoken instead:   + @12.5 de här orden var för tysta",
+        "#     or give both ends:           + @12.5-14 de här orden var för tysta",
+        "#     (seconds from the start of the clip; the gaps in the numbers below tell",
+        "#      you roughly where the silence is).",
         "#   * DELETE a caption: remove its line, or clear the words after the | .",
         "#   * Added and changed lines are re-timed against the audio automatically;",
         "#     unchanged lines keep their exact timing.",
@@ -494,6 +532,24 @@ def open_editor(path):
 
 
 _ROW = re.compile(r"^\s*(\d+)\s*\|\s*(.*)$")
+_AT = re.compile(r"^@(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?$")
+
+
+def parse_at(tokens):
+    """Pull an optional '@12.5' or '@12.5-14' off the front of an added line.
+
+    Forced alignment cannot place words it can't hear. Where speech is buried under
+    music or game audio the aligner collapses an added phrase against the start of the
+    gap, so there has to be a way to say plainly when the line is spoken.
+    """
+    if not tokens:
+        return tokens, None
+    m = _AT.match(tokens[0])
+    if not m:
+        return tokens, None
+    start = float(m.group(1))
+    end = float(m.group(2)) if m.group(2) else None
+    return tokens[1:], (start, end)
 
 
 def read_transcript(path):
@@ -519,7 +575,8 @@ def read_transcript(path):
                 if body.startswith("|"):
                     body = body[1:].lstrip()
             toks = [t.replace("[?]", "") for t in body.split()]
-            entries.append({"kind": "new", "tokens": [t for t in toks if t]})
+            toks, at = parse_at([t for t in toks if t])
+            entries.append({"kind": "new", "tokens": toks, "at": at})
     return entries
 
 
@@ -531,8 +588,10 @@ def retime(orig_segments, orig_words, entries, audio, device, cache, duration):
 
     * an unchanged existing row keeps its exact word timings;
     * a changed existing row is re-aligned within its original window;
-    * a NEW row is re-aligned within the time gap between its neighbours
-      (the aligner matches phonemes to the waveform, so it needs no manual timestamp);
+    * a NEW row with '@12.5' uses exactly that window — the escape hatch for speech the
+      aligner cannot hear, e.g. dialogue under game audio, where it otherwise collapses
+      the phrase against the start of the gap;
+    * a NEW row without one is re-aligned within the gap between its neighbours;
     * an emptied row is dropped.
 
     Returns a list of per-row word lists, in the order the rows appear.
@@ -546,6 +605,12 @@ def retime(orig_segments, orig_words, entries, audio, device, cache, duration):
         if e["kind"] == "existing" and 0 <= e["idx"] < len(orig_segments):
             seg = orig_segments[e["idx"]]
             win[i] = [float(seg["start"]), float(seg["end"])]
+        elif e.get("at"):
+            # an explicit '@12.5' or '@12.5-14': trust it, it beats a guess
+            start, end = e["at"]
+            if end is None:                    # estimate a readable span from the words
+                end = start + 0.45 * max(1, len(e["tokens"])) + 0.3
+            win[i] = [start, max(end, start + 0.2)]
 
     # 2) fill runs of new rows from the surrounding anchors, subdividing the gap evenly
     i = 0
@@ -566,7 +631,7 @@ def retime(orig_segments, orig_words, entries, audio, device, cache, duration):
         i = j
 
     # 3) build one word list per row
-    rows, realigned, added = [], 0, 0
+    rows, realigned, added, timed = [], 0, 0, 0
     for e, w in zip(entries, win):
         tokens = e["tokens"]
         if not tokens:                            # emptied -> drop
@@ -578,12 +643,20 @@ def retime(orig_segments, orig_words, entries, audio, device, cache, duration):
                              for t, o in zip(tokens, orig)])
                 continue
             realigned += 1
+        elif e.get("at"):
+            # You said when. Spread the words across that window rather than asking the
+            # aligner, which is exactly the thing that couldn't hear them.
+            timed += 1
+            rows.append(spread(tokens, w[0], w[1]))
+            continue
         else:
             added += 1
         rows.append(realign_within(tokens, w[0], w[1], audio, device, cache))
 
-    print(f"      {realigned} changed line(s) re-aligned, {added} new line(s) placed; "
-          "the rest kept their timing.")
+    note = f"      {realigned} changed line(s) re-aligned, {added} new line(s) placed"
+    if timed:
+        note += f", {timed} placed at the time you gave"
+    print(note + "; the rest kept their timing.")
     return rows
 
 
@@ -1005,6 +1078,8 @@ Everything below is an override. None of it is needed for the two lines above.""
                 wav, args.model, device, compute, args.batch, args.cache,
                 vad_options or None, asr_options or None)
             duration = len(audio) / 16000.0           # WhisperX audio is 16 kHz mono
+            # one line per speech burst, so a missed sentence can be added at the pause
+            segments = split_segments(segments)
             orig_words = write_transcript(segments, txt, args.flag_below)
 
             if args.no_review:

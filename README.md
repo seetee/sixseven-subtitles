@@ -133,16 +133,29 @@ what gets captioned.** Format:
 - **Fix or rewrite a line** — edit the words freely. A spelling-only change keeps the exact
   timings; changing the number of words re-aligns just that line against its own audio.
 - **Add a line the recogniser missed** — write it on its own line, in reading order, e.g.
-  `+ de här orden var för tysta` (the leading `+` is optional; a bare line works too). It gets
-  placed in the time gap between its neighbours automatically — no timestamps to type. This is
-  the fix for soft speech that was dropped entirely; forced alignment matches the words you
-  typed straight to the waveform, so as long as they were spoken (just quietly) they land in
-  roughly the right place.
+  `+ de här orden var för tysta` (the leading `+` is optional; a bare line works too). Forced
+  alignment matches what you typed against the waveform and places it for you.
+
+  **If the speech is buried under music or game audio, say when it is spoken.** The aligner
+  matches phonemes it can hear; where it can't, it collapses the phrase against the start of
+  the gap and the line lands seconds from where it belongs. Give it a time instead:
+
+  ```
+  + @12.5 de här orden var för tysta        # from 12.5s, span estimated from the words
+  + @12.5-14 de här orden var för tysta     # exactly 12.5s to 14s
+  ```
+
+  Seconds from the start of the clip. A time you give is used verbatim — the aligner isn't
+  consulted at all, so it can't overrule you. The timestamps beside each line show you where
+  the gaps are.
 - **Delete a caption** — remove its whole line, or clear the words after the `|`.
 
 Longer lines are split into on-screen rows automatically: first at pauses in the speech, so a
 row never stays up through a silence, then balanced so you don't get a single word stranded
 on its own row. Rows wrap to stay inside the frame if they'd be too wide.
+
+Each line is one burst of speech, split at pauses, so the gaps between the numbers show you
+where the silences are — that's where a missed sentence belongs.
 
 **If the captions feel out of sync, check for missing words first.** A hole in the transcript
 looks exactly like drift — the captions either side are correctly timed, but the gap makes

@@ -261,6 +261,39 @@ def test_aligner_cache():
         c.load_aligner.cache_clear()
 
 
+def test_split_segments():
+    """WhisperX segments run long — an observed one covered 2.95s to 23.01s, swallowing a
+    ten-second silence. With no line boundary at the pause there is nowhere to add the
+    sentence that was missed, so it lands in the gap after the segment instead."""
+    seg = {"start": 0.0, "end": 20.0, "words": [
+        {"word": "a", "start": 0.0, "end": 0.3}, {"word": "b", "start": 0.4, "end": 0.7},
+        {"word": "c", "start": 18.0, "end": 18.3}]}
+    out = c.split_segments([seg])
+    assert len(out) == 2, "the silence must become a line boundary"
+    assert (out[0]["start"], out[0]["end"]) == (0.0, 0.7)
+    assert (out[1]["start"], out[1]["end"]) == (18.0, 18.3)
+    assert [w["word"] for w in out[0]["words"]] == ["a", "b"]
+
+
+def test_parse_at(tmp):
+    """Speech under game audio is inaudible to the aligner, so the time has to be sayable."""
+    assert c.parse_at(["@12.5", "hej"]) == (["hej"], (12.5, None))
+    assert c.parse_at(["@12.5-14", "hej"]) == (["hej"], (12.5, 14.0))
+    assert c.parse_at(["hej", "@12"]) == (["hej", "@12"], None)   # only leading counts
+    assert c.parse_at(["12.5", "hej"]) == (["12.5", "hej"], None)  # needs the @
+
+    tmp.write_text("0001 | ett\n+ @12.5 tva\n+ @20-22.5 tre\n", encoding="utf-8")
+    e = c.read_transcript(tmp)
+    assert [x.get("at") for x in e] == [None, (12.5, None), (20.0, 22.5)]
+
+    # an explicit time is used verbatim, without consulting the aligner (audio=None proves it)
+    segs = [{"start": 1.0, "end": 2.0}]
+    words = [[{"word": "ett", "start": 1.0, "end": 2.0}]]
+    rows = c.retime(segs, words, e, None, "cpu", "", 30.0)
+    assert rows[1][0]["start"] == 12.5
+    assert (rows[2][0]["start"], rows[2][-1]["end"]) == (20.0, 22.5)
+
+
 def test_retime_keeps_and_fills():
     segs = [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": 3.0}]
     words = [[{"word": "a", "start": 0.0, "end": 1.0}],
