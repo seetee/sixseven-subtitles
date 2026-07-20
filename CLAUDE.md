@@ -119,9 +119,14 @@ Key sections, in the order execution actually flows through `main()`:
   `split_lines` breaks a segment at pauses longer than `PAUSE` (0.7 s) *before* `split_even`
   balances by word count. This is not optional polish: WhisperX segments are coarse — one
   observed segment spanned a ten-second silence — and a row that straddles silence sits
-  frozen on screen with a word highlighted while nobody speaks. `layout_lines` then pairs
-  each row with its window, holding it `HOLD` (0.4 s) past its last word but never into the
-  next row. **Both `build_ass` and `build_srt` go through `layout_lines`** so the sidecar
+  frozen on screen with a word highlighted while nobody speaks. `clamp_words` caps a single word at `MAX_WORD` (1.2 s): alignment pads a word to fill the
+  silence after it — an observed `klock.` ran 2.9 s when the speaker said it in a fraction of
+  that — and capping also exposes the real pause so `split_lines` can close the row.
+  `merge_brief` then folds away rows shorter than `MIN_ROW` (0.5 s), which alignment produces
+  by packing words 0.02 s apart; it runs on the *flattened* rows because a 0.12 s row can be
+  a whole WhisperX segment with nothing beside it to merge, and it never merges across a
+  pause. `layout_lines` then pairs each row with its window, holding it `HOLD` (0.4 s) past
+  its last word but never into the next row. **Both `build_ass` and `build_srt` go through `layout_lines`** so the sidecar
   always matches the picture; they drifted apart once when only `build_ass` was fixed.
 - **ASS generation** (`build_ass`, `ass_text`, `hex_to_ass`, `ts`): rows from `layout_lines`
   are rendered as ASS `Dialogue` events. All word

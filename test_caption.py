@@ -99,6 +99,33 @@ def test_no_frozen_caption(tmp):
         assert not any(a <= mid <= b for a, b in cues), "srt cue spans a silence"
 
 
+def test_clamp_words():
+    """Alignment pads a word to fill the silence after it — an observed 'klock.' ran 2.9s
+    when it was said in a fraction of that."""
+    out = c.clamp_words([{"word": "klock.", "start": 6.36, "end": 9.28},
+                         {"word": "kort", "start": 9.30, "end": 9.50}])
+    assert out[0]["end"] == 6.36 + c.MAX_WORD          # capped
+    assert out[1]["end"] == 9.50                       # a normal word is untouched
+    # capping must expose the real pause, so split_lines can close the row
+    assert out[1]["start"] - out[0]["end"] > c.PAUSE
+
+
+def test_merge_brief():
+    """A row too short to read is worse than a slightly fuller one."""
+    row = lambda t, n: [{"word": "x", "start": t + i * 0.05, "end": t + i * 0.05 + 0.04}
+                        for i in range(n)]
+    merged = c.merge_brief([row(0.0, 1), row(0.2, 1), row(0.4, 1)], 3)
+    assert len(merged) == 1 and len(merged[0]) == 3     # three flashes become one row
+
+    # never merge across a pause — that would undo split_lines and re-freeze the caption
+    across = c.merge_brief([row(0.0, 1), row(10.0, 1)], 3)
+    assert len(across) == 2
+
+    # never grow past twice the target
+    wide = c.merge_brief([row(0.0, 3), row(0.2, 3), row(0.4, 3)], 3)
+    assert all(len(r) <= 6 for r in wide)
+
+
 def test_ass_text():
     # braces would otherwise open an override block and swallow the caption
     assert c.ass_text("{\\an8}hej") == "\\{⧵an8\\}hej"
