@@ -34,11 +34,13 @@ No build/lint tooling is configured — no `pyproject.toml` or `requirements.txt
 that matter:
 
 ```bash
-python3 test_caption.py              # the test suite: plain asserts, no framework, no ML deps
+make test                            # the test suite: plain asserts, no framework, no ML deps
 python3 -m py_compile caption        # syntax check without running anything
 python3 caption --list-themes        # exercises arg parsing + themes.toml loading + validation
 python3 caption --help
 ```
+
+`VERSION` at the top of `caption` feeds `--version`; bump it when tagging a release.
 
 `test_caption.py` covers the pure-Python logic — colour/timestamp conversion, `split_even`,
 ASS escaping, every `resolve_theme` rejection, the transcript round-trip, `retime` (with the

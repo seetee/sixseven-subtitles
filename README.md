@@ -103,6 +103,10 @@ caption --list-themes                # show the themes and their settings
 Re-export the clip and the saved timings are ignored automatically — they're older than the
 file they describe, so `caption` transcribes it again without being asked.
 
+`caption --help` has the rest, grouped: *recognition* (model, batch size, confidence
+threshold, VAD thresholds), *encoding* (codec, bitrate, quality, threads) and *files and
+setup* (model cache, themes path, install behaviour). You shouldn't need any of it.
+
 If quiet speech is being missed, `--sensitive` lowers the voice-detection and no-speech
 thresholds so more of it is transcribed. For finer control, set them yourself with
 `--vad-onset` / `--vad-offset` (defaults 0.5 / 0.363; lower catches fainter speech) and
@@ -193,9 +197,12 @@ words_per_line = 4
 Shipped themes: `classic`, `cyan-centre`, `one-word`, `sweep`, `top-magenta`, `mint`.
 Run `caption --list-themes` to see them.
 
-Keys: `font`, `font_size`, `base_colour`, `accent_colour`, `outline`, `outline_width`,
+Keys — this is the complete set, and anything else is rejected with a message naming the
+theme: `font`, `font_size`, `base_colour`, `accent_colour`, `outline`, `outline_width`,
 `shadow`, `position`, `margin_v`, `margin_h`, `wrap`, `words_per_line`, `animation`
-(`pop`|`sweep`), `pop_scale`, `bold`. Colours are `#RRGGBB` (the tool converts them to ASS's
+(`pop`|`sweep`), `pop_scale`, `bold`, `play_w`, `play_h`. The last two are the canvas the
+sizes are relative to (1080×1920); leave them alone unless you're targeting a different
+frame. Colours are `#RRGGBB` (the tool converts them to ASS's
 `&HAABBGGRR` BGR form for you). `words_per_line` is a target maximum per on-screen row, not a
 hard split — words are grouped in balanced rows and long ones wrap to fit. `wrap` is libass's
 WrapStyle (`0` = balanced wrapping, the default; `2` = never wrap), and `margin_h` is the side
@@ -270,7 +277,7 @@ isn't used (WhisperX passes audio in-memory), so the run continues. To silence i
   sidecars) is covered by `test_caption.py` — plain asserts, no framework, no ML deps:
 
   ```bash
-  python3 test_caption.py
+  make test          # or: python3 test_caption.py
   ```
 
   The `--from` path is exercisable end to end with only `ffmpeg` installed. The full

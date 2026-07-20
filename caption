@@ -44,6 +44,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 #  Defaults
 # --------------------------------------------------------------------------- #
+VERSION       = "1.0"
 DEFAULT_MODEL = "KBLab/kb-whisper-small"
 ALIGN_MODEL   = "KBLab/wav2vec2-large-voxrex-swedish"
 LANG          = "sv"
@@ -778,6 +779,7 @@ Everything below is an override. None of it is needed for the two lines above.""
     ap.add_argument("--sensitive", action="store_true",
                     help="catch softer/quieter speech (lower VAD + no-speech thresholds)")
     ap.add_argument("-v", "--verbose", action="store_true", help="show the ffmpeg commands and their output")
+    ap.add_argument("--version", action="version", version=f"67subtitles {VERSION} (caption)")
 
     g = ap.add_argument_group("recognition", "only when the transcription comes out wrong")
     g.add_argument("--flag-below", type=float, default=FLAG_BELOW, help="confidence below which a word gets [?]")
