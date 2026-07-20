@@ -140,8 +140,16 @@ what gets captioned.** Format:
   roughly the right place.
 - **Delete a caption** — remove its whole line, or clear the words after the `|`.
 
-Longer lines are split into on-screen rows automatically, balanced so you never get a single
-word stranded on its own row, and wrapped to stay inside the frame if they'd be too wide.
+Longer lines are split into on-screen rows automatically: first at pauses in the speech, so a
+row never stays up through a silence, then balanced so you don't get a single word stranded
+on its own row. Rows wrap to stay inside the frame if they'd be too wide.
+
+**If the captions feel out of sync, check for missing words first.** A hole in the transcript
+looks exactly like drift — the captions either side are correctly timed, but the gap makes
+everything feel late. The `[?]` markers and the `.srt` are the quickest way to spot it, and
+you can type the missing line straight into the transcript; forced alignment places it for
+you. `--sensitive` helps on clips where quiet speech is dropped, though it isn't a universal
+win — on some clips it recognises less, which is why it isn't the default.
 
 ---
 

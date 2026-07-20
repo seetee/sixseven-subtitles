@@ -115,9 +115,16 @@ Key sections, in the order execution actually flows through `main()`:
 - **Re-timing** (`retime`): assigns a time window to every row (existing rows use their
   original segment window; runs of new rows subdivide the gap between their nearest timed
   neighbours), then only re-runs alignment for rows that actually changed or were added.
-- **ASS generation** (`build_ass`, `split_even`, `ass_text`, `hex_to_ass`, `ts`): rows are
-  split into on-screen lines via `split_even` (balanced, no lone trailing word — 7 words at
-  target 3 is `[3, 2, 2]`, not `[3, 3, 1]`), then rendered as ASS `Dialogue` events. All word
+- **Caption layout** (`split_lines`, `split_even`, `layout_lines`): the timing-critical part.
+  `split_lines` breaks a segment at pauses longer than `PAUSE` (0.7 s) *before* `split_even`
+  balances by word count. This is not optional polish: WhisperX segments are coarse — one
+  observed segment spanned a ten-second silence — and a row that straddles silence sits
+  frozen on screen with a word highlighted while nobody speaks. `layout_lines` then pairs
+  each row with its window, holding it `HOLD` (0.4 s) past its last word but never into the
+  next row. **Both `build_ass` and `build_srt` go through `layout_lines`** so the sidecar
+  always matches the picture; they drifted apart once when only `build_ass` was fixed.
+- **ASS generation** (`build_ass`, `ass_text`, `hex_to_ass`, `ts`): rows from `layout_lines`
+  are rendered as ASS `Dialogue` events. All word
   text goes through `ass_text`, which escapes `{`/`}`/`\` — the transcript is hand-edited, so
   it is untrusted input to a markup format. `pop` emits one event per active word with inline
   `\c` recolour (+ optional `\fscx/\fscy` size bump); `sweep` emits one event per line using
@@ -157,6 +164,12 @@ measurements:
   is not wired up — it needs its own quality knobs, since `--cpu-used` doesn't apply.
 - **A GPU is not worth it.** CUDA touches only the ~15 s of ML work, saving on the order of
   ten seconds of a ~90 s run. Device detection is automatic (`torch.cuda.is_available()`).
+- **`--sensitive` must not become the default.** Measured on four real clips (speech
+  coverage against an energy estimate): 79%→79%, 84%→86%, 59%→**51%**, 47%→**71%**. It
+  rescues clips where speech is dropped and actively hurts others. Per-clip override, as is.
+- **Missed speech is a separate problem from caption timing.** If captions feel out of sync,
+  check whether words are missing first (compare the `.json` word spans against where the
+  audio is actually loud) — a hole in the transcript reads exactly like drift.
 - **Batching the re-alignment is not worth it.** `whisperx.align()` loops per segment with
   one model forward each, so N segments in one call costs the same as N calls. Re-alignment
   also only runs for rows whose word count changed, which is rare.

@@ -34,6 +34,71 @@ def test_split_even():
     assert [len(x) for x in c.split_even(list(range(4)), 1)] == [1, 1, 1, 1]
 
 
+def _ass_secs(t):
+    h, m, rest = t.split(":")
+    s, cs = rest.split(".")
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100
+
+
+def _spans(path):
+    out = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        if ln.startswith("Dialogue:"):
+            f = ln.split(",", 9)
+            out.append((_ass_secs(f[1]), _ass_secs(f[2])))
+    return out
+
+
+def test_split_lines_breaks_at_pauses():
+    """A row must never straddle silence — see test_no_frozen_caption for why."""
+    w = lambda t: {"word": "x", "start": t, "end": t + 0.3}
+    lines = c.split_lines([w(0.0), w(0.4), w(0.8), w(11.0), w(11.4)], 3)
+    assert [len(l) for l in lines] == [3, 2]
+    for l in lines:                                   # no row spans the 10s gap
+        assert l[-1]["end"] - l[0]["start"] < 2.0
+    # without a pause it behaves exactly like split_even
+    packed = [w(i * 0.4) for i in range(7)]
+    assert [len(l) for l in c.split_lines(packed, 3)] == [3, 2, 2]
+
+
+def test_no_frozen_caption(tmp):
+    """The real bug this guards: WhisperX returns coarse segments, one of which spanned a
+    ten-second silence. Splitting by word count alone left 'så bra Du' on screen for 10.6s
+    with a word highlighted while nobody spoke."""
+    words = [{"word": f"w{i}", "start": s, "end": s + 0.3}
+             for i, s in enumerate([0.0, 0.4, 0.8, 11.0, 11.4, 11.8])]
+    silences = [(a["end"], b["start"]) for a, b in zip(words, words[1:])
+                if b["start"] - a["end"] > c.PAUSE]
+    assert silences, "the fixture is supposed to contain a silence"
+
+    for anim in ("pop", "sweep"):
+        theme = c.resolve_theme({"t": {"animation": anim}}, "t")
+        c.build_ass([words], theme, tmp)
+        spans = _spans(tmp)
+        # nothing may be on screen while nobody is speaking (beyond the brief hold)
+        for s_start, s_end in silences:
+            mid = (s_start + s_end) / 2
+            assert not any(a <= mid <= b for a, b in spans), \
+                f"{anim}: caption still up {mid - s_start:.1f}s into a silence"
+        # and no row may outlast its own last word by more than the hold
+        assert max(b for _, b in spans) <= words[-1]["end"] + c.HOLD + 1e-9
+        for (_, end), (nxt, _) in zip(spans, spans[1:]):
+            assert end <= nxt + 1e-9, f"{anim}: events overlap"
+
+    # the .srt must agree with the picture — these drifted apart once
+    theme = c.resolve_theme({"t": {}}, "t")
+    c.build_srt([words], theme, tmp)
+    cues = []
+    for block in tmp.read_text(encoding="utf-8").strip().split("\n\n"):
+        a, b = block.splitlines()[1].split(" --> ")
+        to_s = lambda t: (int(t[:2]) * 3600 + int(t[3:5]) * 60
+                          + int(t[6:8]) + int(t[9:]) / 1000)
+        cues.append((to_s(a), to_s(b)))
+    for s_start, s_end in silences:
+        mid = (s_start + s_end) / 2
+        assert not any(a <= mid <= b for a, b in cues), "srt cue spans a silence"
+
+
 def test_ass_text():
     # braces would otherwise open an override block and swallow the caption
     assert c.ass_text("{\\an8}hej") == "\\{⧵an8\\}hej"
@@ -84,9 +149,10 @@ def test_build_srt(tmp):
     n = c.build_srt(rows, {"words_per_line": 2}, tmp)
     assert n == 2                                   # one cue per on-screen line
     body = tmp.read_text(encoding="utf-8")
-    # a cue spans from its first word's start to its last word's end
+    # A cue runs from its first word's start until HOLD past its last word — except when
+    # the next cue is already due, which truncates the first one exactly at 1.000.
     assert body == ("1\n00:00:00,000 --> 00:00:01,000\nhej där\n\n"
-                    "2\n00:00:01,000 --> 00:00:01,500\ndu\n\n")
+                    "2\n00:00:01,000 --> 00:00:01,900\ndu\n\n")
 
 
 def test_words_round_trip(tmp):
@@ -126,7 +192,15 @@ def test_pick_saved_words(tmp):
 
     os.utime(saved, (clip.stat().st_atime + 10, clip.stat().st_mtime + 10))
     assert c.pick_saved_words(args(fresh=True), saved) is None        # --fresh overrides
-    assert c.pick_saved_words(args(), d / "absent.json") is None      # nothing saved yet
+
+    # -o put the output elsewhere, but the clip's own timings are still good: use them
+    # rather than silently re-running a transcription that's already been done.
+    assert c.pick_saved_words(args(), d / "elsewhere.json") == saved
+
+    lonely = d / "lonely.webm"
+    lonely.write_text("x")
+    assert c.pick_saved_words(args(input=lonely), d / "lonely_captioned.json") is None
+    lonely.unlink()
 
     other.write_text("[]")
     assert c.pick_saved_words(args(from_words=other), saved) == other  # explicit path wins

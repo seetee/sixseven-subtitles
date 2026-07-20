@@ -44,11 +44,13 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 #  Defaults
 # --------------------------------------------------------------------------- #
-VERSION       = "1.0.1"
+VERSION       = "1.0.2"
 DEFAULT_MODEL = "KBLab/kb-whisper-small"
 ALIGN_MODEL   = "KBLab/wav2vec2-large-voxrex-swedish"
 LANG          = "sv"
 FLAG_BELOW    = 0.5                       # words below this alignment score get a [?]
+PAUSE         = 0.7                       # a caption row must never straddle a gap this long
+HOLD          = 0.4                       # keep a finished row up this long, if nothing follows
 
 # Where the heavy ML dependencies live. Overridable with CAPTION_VENV.
 # Defaults to the path suggested in the manual install, so an existing one is reused.
@@ -603,6 +605,45 @@ def split_even(words, target):
     return out
 
 
+def split_lines(words, target, pause=PAUSE):
+    """On-screen rows for one transcription segment.
+
+    Break at pauses BEFORE balancing by count. WhisperX segments are coarse — one can
+    span a ten-second silence — and a row that straddles silence sits frozen on screen
+    with a word highlighted while nobody is speaking. That is the worst-looking timing
+    fault this tool can produce, and splitting by word count alone guarantees it.
+    """
+    out, burst = [], []
+    for w in words:
+        if burst and w["start"] - burst[-1]["end"] > pause:
+            out += split_even(burst, target)
+            burst = []
+        burst.append(w)
+    if burst:
+        out += split_even(burst, target)
+    return out
+
+
+def layout_lines(segments_words, target):
+    """Rows paired with the window they're on screen for: [(line, start, end), …].
+
+    The single source of truth for caption timing. Both the burnt-in ASS and the .srt
+    sidecar go through here, so the sidecar always matches what's in the picture —
+    they drifted apart once already when only one of them learned about pauses.
+    """
+    lines = [ln for words in segments_words for ln in split_lines(words, target) if ln]
+    out = []
+    for i, line in enumerate(lines):
+        due = lines[i + 1][0]["start"] if i + 1 < len(lines) else None
+        # Hold the row briefly after its last word so it isn't snatched away mid-read,
+        # but never past the next row and never shorter than the words themselves.
+        end = line[-1]["end"] + HOLD
+        if due is not None:
+            end = min(end, due)
+        out.append((line, line[0]["start"], max(end, line[-1]["end"])))
+    return out
+
+
 def build_ass(segments_words, theme, path):
     """segments_words: list of per-segment word lists (already re-timed)."""
     base   = hex_to_ass(theme["base_colour"])
@@ -641,34 +682,29 @@ def build_ass(segments_words, theme, path):
         pop = f"\\fscx{s}\\fscy{s}"
 
     events = []
-    for words in segments_words:
-        for line in split_even(words, theme["words_per_line"]):
-            if not line:
-                continue
-            l_start, l_end = line[0]["start"], line[-1]["end"]
-
-            if sweep:
-                # one event; each word fills base -> accent over its own time
-                parts = []
-                for j, w in enumerate(line):
-                    nxt = line[j + 1]["start"] if j + 1 < len(line) else l_end
-                    cs = max(1, int(round((nxt - w["start"]) * 100)))
-                    parts.append(f"{{\\kf{cs}}}{ass_text(w['word'])}")
-                events.append(f"Dialogue: 0,{ts(l_start)},{ts(l_end)},Cap,,0,0,0,,{' '.join(parts)}")
-            else:
-                # one event per active word; that word is recoloured (and optionally enlarged)
-                for j, w in enumerate(line):
-                    start = w["start"]
-                    end = line[j + 1]["start"] if j + 1 < len(line) else w["end"]
-                    if end <= start:
-                        end = start + 0.04
-                    chips = []
-                    for k, ww in enumerate(line):
-                        if k == j:
-                            chips.append(f"{{\\c{accent}&{pop}}}{ass_text(ww['word'])}{{\\r}}")
-                        else:
-                            chips.append(ass_text(ww["word"]))
-                    events.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,{' '.join(chips)}")
+    for line, l_start, l_end in layout_lines(segments_words, theme["words_per_line"]):
+        if sweep:
+            # one event; each word fills base -> accent over its own time
+            parts = []
+            for j, w in enumerate(line):
+                nxt = line[j + 1]["start"] if j + 1 < len(line) else line[-1]["end"]
+                cs = max(1, int(round((nxt - w["start"]) * 100)))
+                parts.append(f"{{\\kf{cs}}}{ass_text(w['word'])}")
+            events.append(f"Dialogue: 0,{ts(l_start)},{ts(l_end)},Cap,,0,0,0,,{' '.join(parts)}")
+        else:
+            # one event per active word; that word is recoloured (and optionally enlarged)
+            for j, w in enumerate(line):
+                start = w["start"]
+                end = line[j + 1]["start"] if j + 1 < len(line) else l_end
+                if end <= start:
+                    end = start + 0.04
+                chips = []
+                for k, ww in enumerate(line):
+                    if k == j:
+                        chips.append(f"{{\\c{accent}&{pop}}}{ass_text(ww['word'])}{{\\r}}")
+                    else:
+                        chips.append(ass_text(ww["word"]))
+                events.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,{' '.join(chips)}")
 
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return len(events)
@@ -707,12 +743,19 @@ def pick_saved_words(args, words_json):
         if not args.from_words.is_file():
             die(f"no such timings file: {args.from_words}")
         return args.from_words
-    if args.fresh or not words_json.is_file():
+    if args.fresh:
         return None
-    if words_json.stat().st_mtime < args.input.stat().st_mtime:
-        print(f"note: {words_json.name} is older than the clip — transcribing again.")
-        return None
-    return words_json
+    # Beside the output first, then beside the input: the timings describe the *clip*, so
+    # `-o somewhere/else.webm` must not silently throw away a transcription you already did.
+    default = Path(f"{args.input.with_suffix('')}_captioned.json")
+    for candidate in (words_json, default):
+        if not candidate.is_file():
+            continue
+        if candidate.stat().st_mtime < args.input.stat().st_mtime:
+            print(f"note: {candidate.name} is older than the clip — transcribing again.")
+            return None
+        return candidate
+    return None
 
 
 def srt_ts(t):
@@ -727,12 +770,8 @@ def srt_ts(t):
 def build_srt(segments_words, theme, path):
     """A plain subtitle file matching what gets burnt in — selectable, searchable,
     readable by a screen reader, and translatable. Burnt-in text is none of those."""
-    cues = []
-    for words in segments_words:
-        for line in split_even(words, theme["words_per_line"]):
-            if line:
-                cues.append((line[0]["start"], line[-1]["end"],
-                             " ".join(w["word"] for w in line)))
+    cues = [(start, end, " ".join(w["word"] for w in line))
+            for line, start, end in layout_lines(segments_words, theme["words_per_line"])]
     path.write_text(
         "".join(f"{i}\n{srt_ts(a)} --> {srt_ts(b)}\n{text}\n\n"
                 for i, (a, b, text) in enumerate(cues, 1)), encoding="utf-8")
