@@ -49,11 +49,12 @@ CI (`.github/workflows/tests.yml`) runs that suite on Python 3.11 and 3.13 for e
 `main` and every PR. It installs nothing — keeping `test_caption.py` and the module scope of
 `caption` stdlib-only is what makes that possible, so don't add an import that breaks it.
 
-**The `--from` path is fully exercisable without WhisperX or torch** — it needs only ffmpeg.
-That makes it the way to test the real pipeline end to end while iterating:
+**The resume path is fully exercisable without WhisperX or torch** — it needs only ffmpeg.
+That makes it the way to test the real pipeline end to end while iterating: run once with
+the ML stack (or drop a hand-written `<output>.json` beside a clip), then
 
 ```bash
-python3 caption clip.webm --from clip_captioned.json --theme sweep
+python3 caption clip.webm --theme sweep      # reuses the saved timings automatically
 ```
 
 A full transcribe→burn run needs `ffmpeg` (with `libvpx` + `libass`) and the ML stack; the
@@ -120,6 +121,11 @@ Key sections, in the order execution actually flows through `main()`:
   `\c` recolour (+ optional `\fscx/\fscy` size bump); `sweep` emits one event per line using
   karaoke `\kf` tags. Colours are converted `#RRGGBB` → ASS's `&HAABBGGRR` (BGR, alpha
   first) by `hex_to_ass`.
+- **Resume** (`pick_saved_words`): the UX rule is *don't redo finished work*. A completed run
+  leaves `<output>.json`; the next run reuses it automatically when it is newer than the
+  input clip, skipping extraction, ASR, alignment and the review step. A stale file (clip
+  re-exported) or `--fresh` falls back to the full pipeline; `--from` names a different file
+  explicitly. Keep this the default — flags are for overrides, never for the normal path.
 - **Sidecars** (`save_words`, `load_words`, `build_srt`, `srt_ts`): every run writes
   `<output>.json` (the re-timed words, the input to `--from`) and `<output>.srt` (a subtitle
   track matching the burnt-in lines). Both are written *before* the encode, so a failed burn
@@ -152,6 +158,22 @@ measurements:
 - **Batching the re-alignment is not worth it.** `whisperx.align()` loops per segment with
   one model forward each, so N segments in one call costs the same as N calls. Re-alignment
   also only runs for rows whose word count changed, which is rare.
+
+## UX rules
+
+The owner's stated priorities, which override tidiness arguments:
+
+- **Don't redo work that's already done.** If something on disk shows a stage finished, skip
+  it and say so. `pick_saved_words` is the current example.
+- **Smart defaults, flags only for overrides.** The common path must need no flags at all.
+  Before adding one, ask whether the right behaviour can be detected instead.
+- **Keep `--help` scannable.** Common options first; everything else in the `recognition`,
+  `encoding` and `files and setup` argument groups.
+- **Quiet by default.** ffmpeg runs at `-v error`; `-stats` only when stderr is a TTY,
+  because its `\r` redraw becomes thousands of lines when piped. `--verbose` shows
+  everything, including the commands.
+- **One command to install** (`make install`), and it must never clobber a config file the
+  user may have edited.
 
 ## Notes for changes
 

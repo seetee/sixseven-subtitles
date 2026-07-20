@@ -51,23 +51,22 @@ download on the first transcription to `~/.cache/caption-models` — a few GB, o
 ## Install
 
 ```bash
-# 1. the tool  (anywhere on $PATH; the service menu resolves it by name)
-install -Dm755 caption ~/.local/bin/caption
-
-# 2. themes
-install -Dm644 themes.toml ~/.config/caption/themes.toml
-
-# 3. the Dolphin right-click menu (KDE Plasma 6)
-install -Dm755 add-captions.desktop ~/.local/share/kio/servicemenus/add-captions.desktop
-kbuildsycoca6                       # refresh menus, then reopen Dolphin
+make install
 ```
 
-`chmod +x` on the `.desktop` file is **required** on Plasma 6 — an un-executable service
-menu is ignored. `install -Dm755` above already sets that bit.
+That puts `caption` on `$PATH`, registers the Dolphin right-click menu, refreshes the KDE
+menu cache, and tells you if `~/.local/bin` isn't on your `$PATH`. `make uninstall` reverses
+it. `PREFIX=~/bin make install` puts the script somewhere else; the menu and themes are
+per-user by nature and always go to `~/.local/share` and `~/.config`.
 
-The `.desktop` file calls `caption` through `$PATH`, so the three commands above are the
-whole install on any machine. If your desktop session doesn't have `~/.local/bin` on `$PATH`,
-put an absolute path in the two `Exec=` lines instead.
+It **won't overwrite an existing `~/.config/caption/themes.toml`** — that's a config file you
+may have added your own themes to. If the repo's copy has since gained themes you want, it
+tells you they differ and leaves merging to you.
+
+The `.desktop` file calls `caption` through `$PATH`, so this works on any machine. If your
+desktop session doesn't have `~/.local/bin` on `$PATH`, put an absolute path in the two
+`Exec=` lines instead. (The `.desktop` file must be executable on Plasma 6 or the menu is
+silently ignored — `make install` sets that bit.)
 
 `themes.toml` is searched for in this order: the path given to `--themes`, then
 `~/.config/caption/themes.toml`, then next to the `caption` script. With none found, a
@@ -82,16 +81,27 @@ command; pass it explicitly with `--themes` if that's what you want.
 From the command line:
 
 ```bash
-caption clip.webm                    # classic theme, opens the editor to correct words
-caption clip.webm -t cyan-centre     # a named theme
+caption clip.webm                    # transcribe, fix the words, burn them in
+caption clip.webm -t mint            # run it again — reuses the timings, seconds not minutes
+```
+
+That second line is the whole point: **a finished run leaves its word timings beside the
+clip, and the next run picks them up automatically.** No transcribing, no review, straight
+to the burn. Trying five themes costs one transcription and five encodes.
+
+The rest are overrides you'll rarely reach for:
+
+```bash
+caption clip.webm --fresh            # ignore the saved timings; start from the audio again
 caption clip.webm --ask-theme        # pick a theme interactively
 caption clip.webm --sensitive        # catch softer/quieter speech the recogniser tends to drop
-caption clip.webm --no-review        # fully unattended (skip the correction step)
+caption clip.webm --no-review        # don't open the editor; accept the transcription as-is
+caption clip.webm -v                 # show the ffmpeg commands and their output
 caption --list-themes                # show the themes and their settings
-
-# try another look without transcribing again — seconds instead of minutes
-caption clip.webm -t mint --from clip_captioned.json
 ```
+
+Re-export the clip and the saved timings are ignored automatically — they're older than the
+file they describe, so `caption` transcribes it again without being asked.
 
 If quiet speech is being missed, `--sensitive` lowers the voice-detection and no-speech
 thresholds so more of it is transcribed. For finer control, set them yourself with
@@ -145,16 +155,14 @@ Burnt-in captions can't be turned off, resized, or read out. Upload the `.srt` a
 video anywhere that accepts a subtitle track and the captions work for people who need them
 adjustable.
 
-The `.json` is the input to `--from`:
+The `.json` is what makes a second run fast. `caption clip.webm -t sweep` finds it, skips
+audio extraction, transcription, the correction step and re-timing, and goes straight to
+building and burning. It needs no WhisperX or PyTorch at all, only `ffmpeg`. The corrections
+you made in the editor are already baked into the timings, so you never redo them.
 
-```bash
-caption clip.webm -t sweep --from clip_captioned.json
-```
-
-That skips audio extraction, transcription, the correction step and re-timing, and goes
-straight to building and burning — so trying a different theme costs an encode, not a
-transcription. It doesn't need WhisperX or PyTorch installed at all, only `ffmpeg`. The
-corrections you made in the editor are already baked into the timings, so you don't redo them.
+It's reused when it's newer than the clip. Otherwise — you re-exported from Kdenlive, or you
+passed `--fresh` — the full pipeline runs again. `--from OTHER.json` points at a different
+file if you keep several.
 
 Add `--keep-temp` to also keep the intermediate `.wav`, `.ass` and edited `.txt`.
 

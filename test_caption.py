@@ -106,6 +106,40 @@ def test_words_round_trip(tmp):
             raise AssertionError(f"bad timings file accepted: {junk}")
 
 
+def test_pick_saved_words(tmp):
+    """Don't redo finished work — but only when the saved work is still trustworthy."""
+    import argparse, os
+    d = tmp.parent
+    clip, saved, other = d / "clip.webm", d / "clip_captioned.json", d / "other.json"
+    clip.write_text("x")
+    saved.write_text("[]")
+    def args(**kw):
+        return argparse.Namespace(**{"input": clip, "from_words": None, "fresh": False, **kw})
+
+    # saved timings newer than the clip -> reuse them
+    os.utime(saved, (clip.stat().st_atime + 10, clip.stat().st_mtime + 10))
+    assert c.pick_saved_words(args(), saved) == saved
+
+    # re-exported clip (timings now stale) -> transcribe again
+    os.utime(saved, (clip.stat().st_atime - 10, clip.stat().st_mtime - 10))
+    assert c.pick_saved_words(args(), saved) is None
+
+    os.utime(saved, (clip.stat().st_atime + 10, clip.stat().st_mtime + 10))
+    assert c.pick_saved_words(args(fresh=True), saved) is None        # --fresh overrides
+    assert c.pick_saved_words(args(), d / "absent.json") is None      # nothing saved yet
+
+    other.write_text("[]")
+    assert c.pick_saved_words(args(from_words=other), saved) == other  # explicit path wins
+    try:
+        c.pick_saved_words(args(from_words=d / "nope.json"), saved)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("--from with a missing file should fail loudly")
+    for f in (clip, saved, other):
+        f.unlink()
+
+
 def test_aligner_cache():
     """Loaded once, dropped on release, reloaded only when asked for again."""
     import sys, types
