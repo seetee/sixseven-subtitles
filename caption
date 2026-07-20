@@ -418,7 +418,11 @@ def open_editor(path):
     print(f"      Opening '{base}' — edit the words, then save and close.")
     before = path.stat().st_mtime
     t0 = time.time()
-    subprocess.run(argv + [str(path)])
+    try:
+        subprocess.run(argv + [str(path)])
+    except FileNotFoundError:
+        die(f"editor {argv[0]!r} not found. Set $VISUAL or $EDITOR to one you have "
+            "installed, or run with --no-review to skip the correction step.")
     # Safety net for a GUI editor that forked and returned at once:
     if time.time() - t0 < 1.5 and path.stat().st_mtime == before:
         try:
@@ -698,7 +702,10 @@ def main():
         print("Available themes:")
         for n, name in enumerate(names, 1):
             print(f"  {n}) {name}")
-        choice = input("Choose a theme [1]: ").strip() or "1"
+        try:
+            choice = input("Choose a theme [1]: ").strip() or "1"
+        except EOFError:
+            die("no theme chosen (no terminal to ask on). Use --theme NAME instead.")
         try:
             args.theme = names[int(choice) - 1]
         except (ValueError, IndexError):
@@ -766,4 +773,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        die("interrupted.", 130)
+    except subprocess.CalledProcessError as e:
+        die(f"{Path(e.cmd[0]).name} failed (exit {e.returncode}). "
+            "Its output is above — that usually says why.")
