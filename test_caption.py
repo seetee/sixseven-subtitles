@@ -105,6 +105,26 @@ def test_words_round_trip(tmp):
             raise AssertionError(f"bad timings file accepted: {junk}")
 
 
+def test_aligner_cache():
+    """Loaded once, dropped on release, reloaded only when asked for again."""
+    import sys, types
+    loads = []
+    fake = types.ModuleType("whisperx")
+    fake.load_align_model = lambda **kw: (loads.append(kw) or ("model", "meta"))
+    sys.modules["whisperx"] = fake
+    try:
+        c.load_aligner.cache_clear()
+        assert c.load_aligner("cpu", "/tmp") == ("model", "meta")
+        c.load_aligner("cpu", "/tmp")
+        assert len(loads) == 1                      # memoised, not reloaded
+        c.release_aligner("cpu")                    # freed for the review pause
+        c.load_aligner("cpu", "/tmp")
+        assert len(loads) == 2                      # and brought back on demand
+    finally:
+        del sys.modules["whisperx"]
+        c.load_aligner.cache_clear()
+
+
 def test_retime_keeps_and_fills():
     segs = [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": 3.0}]
     words = [[{"word": "a", "start": 0.0, "end": 1.0}],
@@ -117,7 +137,7 @@ def test_retime_keeps_and_fills():
     calls = []
     c.realign_within = lambda toks, s, e, *a: (calls.append((s, e)) or
                                                [{"word": toks[0], "start": s, "end": e}])
-    rows = c.retime(segs, words, entries, None, None, None, "cpu", 5.0)
+    rows = c.retime(segs, words, entries, None, "cpu", "", 5.0)
     assert calls == [(1.0, 2.0)], calls
     assert rows[0][0]["start"] == 0.0 and rows[2][0]["end"] == 3.0   # timings untouched
 

@@ -26,6 +26,7 @@ ML deps present; torch / whisperx are imported lazily, inside the functions that
 """
 
 import argparse
+import functools
 import gc
 import importlib.util
 import json
@@ -310,9 +311,29 @@ def extract_audio(src, wav):
 # --------------------------------------------------------------------------- #
 #  Step 2 — transcribe + align
 # --------------------------------------------------------------------------- #
+@functools.lru_cache(maxsize=1)
+def load_aligner(device, cache):
+    """The phoneme aligner, loaded once and kept. Cached rather than passed around so
+    that release_aligner() can drop it during the review pause and a later re-time can
+    bring it back only if some line actually changed."""
+    import whisperx
+    return whisperx.load_align_model(language_code=LANG, device=device,
+                                     model_name=ALIGN_MODEL, model_dir=cache)
+
+
+def release_aligner(device):
+    """Drop the aligner from memory. It's ~1 GB and does nothing while you edit."""
+    load_aligner.cache_clear()
+    gc.collect()
+    if device == "cuda":
+        import torch
+        torch.cuda.empty_cache()
+
+
 def transcribe(wav, model_name, device, compute_type, batch, cache,
                vad_options=None, asr_options=None):
-    """Return (segments, align_model, metadata, audio). Frees the ASR model afterwards."""
+    """Return (segments, audio). Frees the ASR model afterwards; the aligner is left in
+    load_aligner's cache for the caller to keep or release."""
     print("[2/5] Transcribing and aligning Swedish (first run downloads the models)…")
     import torch                          # noqa: F401  (lazy)
     import whisperx
@@ -326,34 +347,33 @@ def transcribe(wav, model_name, device, compute_type, batch, cache,
     audio = whisperx.load_audio(str(wav))
     result = asr.transcribe(audio, batch_size=batch, language=LANG)
 
-    model_a, metadata = whisperx.load_align_model(
-        language_code=LANG, device=device, model_name=ALIGN_MODEL, model_dir=str(cache))
+    model_a, metadata = load_aligner(device, str(cache))
     aligned = whisperx.align(result["segments"], model_a, metadata, audio, device,
                              return_char_alignments=False)
 
-    # the big ASR model is no longer needed while you edit
+    # the big ASR model is no longer needed once the words are placed
     del asr
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    return aligned["segments"], model_a, metadata, audio
+    return aligned["segments"], audio
 
 
-def realign_text(text, start, end, model_a, metadata, audio, device):
+def realign_text(text, start, end, audio, device, cache):
     """Re-align a single corrected line against the audio; return its word list."""
     import whisperx
+    model_a, metadata = load_aligner(device, cache)
     seg = {"start": float(start), "end": float(end), "text": text}
     out = whisperx.align([seg], model_a, metadata, audio, device,
                          return_char_alignments=False)
     return out["segments"][0].get("words", [])
 
 
-def realign_within(tokens, start, end, model_a, metadata, audio, device):
+def realign_within(tokens, start, end, audio, device, cache):
     """Align a row's words inside [start, end]; fall back to an even spread if alignment
     returns nothing (e.g. speech too faint for the aligner to place)."""
-    words = clean_words(realign_text(" ".join(tokens), start, end,
-                                     model_a, metadata, audio, device))
+    words = clean_words(realign_text(" ".join(tokens), start, end, audio, device, cache))
     if not words:
         span = max(0.01, (end - start)) / max(1, len(tokens))
         words = [{"word": t, "start": start + k * span, "end": start + (k + 1) * span}
@@ -468,7 +488,7 @@ def read_transcript(path):
 # --------------------------------------------------------------------------- #
 #  Re-time after editing
 # --------------------------------------------------------------------------- #
-def retime(orig_segments, orig_words, entries, model_a, metadata, audio, device, duration):
+def retime(orig_segments, orig_words, entries, audio, device, cache, duration):
     """Turn the edited rows into per-row word lists with timings.
 
     * an unchanged existing row keeps its exact word timings;
@@ -522,7 +542,7 @@ def retime(orig_segments, orig_words, entries, model_a, metadata, audio, device,
             realigned += 1
         else:
             added += 1
-        rows.append(realign_within(tokens, w[0], w[1], model_a, metadata, audio, device))
+        rows.append(realign_within(tokens, w[0], w[1], audio, device, cache))
 
     print(f"      {realigned} changed line(s) re-aligned, {added} new line(s) placed; "
           "the rest kept their timing.")
@@ -805,7 +825,7 @@ def main():
                 print(f"Sensitivity: vad={vad_options or 'default'}, asr={asr_options or 'default'}")
 
             extract_audio(args.input, wav)
-            segments, model_a, metadata, audio = transcribe(
+            segments, audio = transcribe(
                 wav, args.model, device, compute, args.batch, args.cache,
                 vad_options or None, asr_options or None)
             duration = len(audio) / 16000.0           # WhisperX audio is 16 kHz mono
@@ -816,11 +836,14 @@ def main():
                            for i, ws in enumerate(orig_words)]
                 print("      Review skipped (--no-review).")
             else:
+                # A review can take hours. Don't hold the aligner for all of it —
+                # retime reloads it only if a line actually needs re-aligning.
+                release_aligner(device)
                 open_editor(txt)
                 entries = read_transcript(txt)
 
             retimed = retime(segments, orig_words, entries,
-                             model_a, metadata, audio, device, duration)
+                             audio, device, str(args.cache), duration)
         n_events = build_ass(retimed, theme, ass)
         print(f"      {n_events} caption events written.")
 
