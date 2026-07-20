@@ -233,24 +233,23 @@ browser plays. `--codec vp8` is still there if something downstream insists on i
 
 ## Troubleshooting
 
-**`operator torchvision::nms does not exist` (at step 2/5)** — a `torchvision` built against
-a different `torch` than the CPU build in the venv. WhisperX never uses vision, so just remove
-it:
+**Warnings during transcription** — the ML stack is chatty on start-up: a `torchcodec`
+loader traceback, a Lightning checkpoint-upgrade notice, a `transformers` deprecation, and
+pyannote's VAD progress. **None of it is an error and none of it stops the run.** All of it
+is silenced by default now; `-v` brings it back when you actually want to look.
+
+**`operator torchvision::nms does not exist`** — this one *is* fatal. A `torchvision` built
+against a different `torch` than the CPU build in the venv. WhisperX never uses vision, so
+remove it:
 
 ```bash
 ~/.venvs/caption/bin/pip uninstall -y torchvision
 ```
 
-Fresh installs now do this automatically, and the dependency check will repair an existing
-venv on the next run.
-
-**`torchcodec is not installed correctly …` (a warning at step 2/5)** — harmless. It's the same
-kind of torch/companion version mismatch, but torchcodec is only Pyannote's file decoder, which
-isn't used (WhisperX passes audio in-memory), so the run continues. To silence it:
-
-```bash
-~/.venvs/caption/bin/pip uninstall -y torchcodec
-```
+Fresh installs do this automatically, and the dependency check repairs an existing venv on
+the next run. `torchcodec` is the same kind of mismatch but harmless — it's only Pyannote's
+file decoder, and WhisperX passes audio in memory. `pip uninstall -y torchcodec` removes the
+cause rather than hiding it.
 
 ---
 

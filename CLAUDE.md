@@ -172,8 +172,15 @@ The owner's stated priorities, which override tidiness arguments:
 - **Keep `--help` scannable.** Common options first; everything else in the `recognition`,
   `encoding` and `files and setup` argument groups.
 - **Quiet by default.** ffmpeg runs at `-v error`; `-stats` only when stderr is a TTY,
-  because its `\r` redraw becomes thousands of lines when piped. `--verbose` shows
+  because its `\r` redraw becomes thousands of lines when piped. `hush_ml_noise()` silences
+  WhisperX's dependency chatter, which users reasonably read as a crash. `--verbose` shows
   everything, including the commands.
+
+  `hush_ml_noise` uses `logging.disable(logging.INFO)`, deliberately: whisperx and lightning
+  each attach their own handler with their own level *while a model loads*, which is after
+  any setup code runs and overrides anything set on their loggers. Per-logger levels were
+  tried and don't work; `logging.basicConfig` is worse, because owning the root handler makes
+  lightning's message print twice. WARNING and above still pass, so real problems show.
 - **One command to install** (`make install`), and it must never clobber a config file the
   user may have edited.
 
