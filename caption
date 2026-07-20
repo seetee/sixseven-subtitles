@@ -32,6 +32,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -670,7 +671,8 @@ def main():
     ap.add_argument("--threads", type=int, default=0, help="encoder threads (0 = auto)")
     ap.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "caption-models",
                     help="where to cache the downloaded models")
-    ap.add_argument("--keep-temp", action="store_true", help="keep the .wav/.json/.ass next to the output")
+    ap.add_argument("--keep-temp", action="store_true",
+                    help="copy the .wav/.ass/.txt next to the output instead of discarding them")
     ap.add_argument("--no-bootstrap", action="store_true",
                     help="don't auto-install WhisperX/torch; just print how to do it")
     ap.add_argument("--gpu", action="store_true",
@@ -692,9 +694,10 @@ def main():
 
     if not args.input.is_file():
         die(f"input not found: {args.input}")
+    # before the multi-GB dependency download, not after
+    need("ffmpeg")
     # make sure the ML stack is present (bootstraps a venv and re-execs if needed)
     ensure_deps(args.no_bootstrap, args.gpu, args.yes)
-    need("ffmpeg")
 
     themes = load_themes(args.themes)
     if args.ask_theme:
@@ -717,10 +720,11 @@ def main():
     print(f"Theme: {args.theme}  ({theme['animation']}, {theme['words_per_line']} word/line, {theme['position']})")
 
     args.cache.mkdir(parents=True, exist_ok=True)
-    stem = args.input.with_suffix("")
-    wav = stem.with_suffix(".wav")
-    ass = stem.with_suffix(".ass")
-    out = args.output or Path(f"{stem}_captioned.webm")
+    out = args.output or Path(f"{args.input.with_suffix('')}_captioned.webm")
+    # Intermediates live in their own directory. Deriving them from the input's name
+    # (with_suffix) turned "my.video.webm" into "my.wav" and deleted whatever that was.
+    tmp = Path(tempfile.mkdtemp(prefix="caption-"))
+    wav, ass, txt = tmp / "audio.wav", tmp / "captions.ass", tmp / "transcript.txt"
 
     import torch
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -741,33 +745,33 @@ def main():
     if vad_options or asr_options:
         print(f"Sensitivity: vad={vad_options or 'default'}, asr={asr_options or 'default'}")
 
-    extract_audio(args.input, wav)
-    segments, model_a, metadata, audio = transcribe(
-        wav, args.model, device, compute, args.batch, args.cache,
-        vad_options or None, asr_options or None)
-    duration = len(audio) / 16000.0               # WhisperX audio is 16 kHz mono
-    orig_words = write_transcript(segments, stem.with_suffix(".txt"), args.flag_below)
+    try:
+        extract_audio(args.input, wav)
+        segments, model_a, metadata, audio = transcribe(
+            wav, args.model, device, compute, args.batch, args.cache,
+            vad_options or None, asr_options or None)
+        duration = len(audio) / 16000.0               # WhisperX audio is 16 kHz mono
+        orig_words = write_transcript(segments, txt, args.flag_below)
 
-    if args.no_review:
-        entries = [{"kind": "existing", "idx": i, "tokens": [w["word"] for w in ws]}
-                   for i, ws in enumerate(orig_words)]
-        print("      Review skipped (--no-review).")
-    else:
-        open_editor(stem.with_suffix(".txt"))
-        entries = read_transcript(stem.with_suffix(".txt"))
+        if args.no_review:
+            entries = [{"kind": "existing", "idx": i, "tokens": [w["word"] for w in ws]}
+                       for i, ws in enumerate(orig_words)]
+            print("      Review skipped (--no-review).")
+        else:
+            open_editor(txt)
+            entries = read_transcript(txt)
 
-    retimed = retime(segments, orig_words, entries, model_a, metadata, audio, device, duration)
-    n_events = build_ass(retimed, theme, ass)
-    print(f"      {n_events} caption events written.")
+        retimed = retime(segments, orig_words, entries, model_a, metadata, audio, device, duration)
+        n_events = build_ass(retimed, theme, ass)
+        print(f"      {n_events} caption events written.")
 
-    burn(args.input, ass, out, args.bitrate, args.crf, args.cpu_used, args.threads)
+        burn(args.input, ass, out, args.bitrate, args.crf, args.cpu_used, args.threads)
 
-    if not args.keep_temp:
-        for f in (wav, ass, stem.with_suffix(".txt"), stem.with_suffix(".json")):
-            try:
-                f.unlink()
-            except FileNotFoundError:
-                pass
+        if args.keep_temp:
+            for f in (wav, ass, txt):
+                shutil.copy2(f, out.with_name(out.stem + f.suffix))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     print(f"\nDone  ->  {out}")
 
