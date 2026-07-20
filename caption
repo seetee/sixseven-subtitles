@@ -12,12 +12,14 @@ Flow:
          otherwise re-align just that line against the audio
       -> build a themed ASS file                        (themes.toml)
       -> burn it into the .webm                         (ffmpeg, VP8 / copy Vorbis)
+      -> leave a .srt and a .json of the word timings next to the output
 
 Usage:
     caption clip.webm                       # classic theme, with review step
     caption clip.webm --theme cyan-centre
     caption clip.webm --no-review           # fully unattended
     caption clip.webm --ask-theme           # pick a theme interactively (used by the menu)
+    caption clip.webm --theme mint --from clip_captioned.json    # re-theme, seconds not minutes
 
 Only the standard library is imported at the top, so the file loads without the heavy
 ML deps present; torch / whisperx are imported lazily, inside the functions that need them.
@@ -26,6 +28,7 @@ ML deps present; torch / whisperx are imported lazily, inside the functions that
 import argparse
 import gc
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -619,6 +622,52 @@ def build_ass(segments_words, theme, path):
 
 
 # --------------------------------------------------------------------------- #
+#  Sidecars — the word timings, and a subtitle file that isn't burnt in
+# --------------------------------------------------------------------------- #
+def save_words(segments_words, path):
+    """Save the re-timed words so a later run can skip straight to --from."""
+    path.write_text(json.dumps(segments_words, ensure_ascii=False), encoding="utf-8")
+
+
+def load_words(path):
+    """Read back a save_words file, checking it really is one."""
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(rows, list) or not rows:
+            raise TypeError("expected a non-empty list of caption rows")
+        return [[{"word": str(w["word"]), "start": float(w["start"]), "end": float(w["end"])}
+                 for w in row] for row in rows]
+    except OSError as e:
+        die(f"could not read {path}: {e}")
+    except (ValueError, TypeError, KeyError) as e:
+        die(f"{path} is not a caption timings file ({type(e).__name__}: {e})")
+
+
+def srt_ts(t):
+    """seconds -> HH:MM:SS,mmm  (SRT timestamp)."""
+    ms = int(round(max(0.0, t) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_srt(segments_words, theme, path):
+    """A plain subtitle file matching what gets burnt in — selectable, searchable,
+    readable by a screen reader, and translatable. Burnt-in text is none of those."""
+    cues = []
+    for words in segments_words:
+        for line in split_even(words, theme["words_per_line"]):
+            if line:
+                cues.append((line[0]["start"], line[-1]["end"],
+                             " ".join(w["word"] for w in line)))
+    path.write_text(
+        "".join(f"{i}\n{srt_ts(a)} --> {srt_ts(b)}\n{text}\n\n"
+                for i, (a, b, text) in enumerate(cues, 1)), encoding="utf-8")
+    return len(cues)
+
+
+# --------------------------------------------------------------------------- #
 #  Step 5b — burn into the webm (VP8 video, Vorbis copied)
 # --------------------------------------------------------------------------- #
 def _filter_path(p):
@@ -654,6 +703,9 @@ def main():
     ap.add_argument("--ask-theme", action="store_true", help="choose a theme interactively")
     ap.add_argument("--list-themes", action="store_true", help="list available themes and exit")
     ap.add_argument("--no-review", action="store_true", help="skip the manual correction step")
+    ap.add_argument("--from", dest="from_words", type=Path, metavar="WORDS.json",
+                    help="reuse saved word timings (written next to every output) and skip "
+                         "transcription entirely — the fast way to try another theme")
     ap.add_argument("--flag-below", type=float, default=FLAG_BELOW, help="confidence below which a word gets [?]")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="KB-Whisper model id")
     ap.add_argument("--device", choices=["cpu", "cuda"], help="force device (default: auto)")
@@ -696,8 +748,9 @@ def main():
         die(f"input not found: {args.input}")
     # before the multi-GB dependency download, not after
     need("ffmpeg")
-    # make sure the ML stack is present (bootstraps a venv and re-execs if needed)
-    ensure_deps(args.no_bootstrap, args.gpu, args.yes)
+    # --from replays saved timings, so the whole ML stack is unnecessary for it
+    if not args.from_words:
+        ensure_deps(args.no_bootstrap, args.gpu, args.yes)
 
     themes = load_themes(args.themes)
     if args.ask_theme:
@@ -726,54 +779,71 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="caption-"))
     wav, ass, txt = tmp / "audio.wav", tmp / "captions.ass", tmp / "transcript.txt"
 
-    import torch
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    compute = args.compute_type or ("float16" if device == "cuda" else "int8")
-    print(f"Device: {device} ({compute})")
-
-    # Layer 1: build the VAD/ASR sensitivity overrides (defaults untouched unless asked)
-    vad_options, asr_options = {}, {}
-    if args.sensitive:
-        vad_options.update(vad_onset=0.3, vad_offset=0.2)
-        asr_options.update(no_speech_threshold=0.4)
-    if args.vad_onset is not None:
-        vad_options["vad_onset"] = args.vad_onset
-    if args.vad_offset is not None:
-        vad_options["vad_offset"] = args.vad_offset
-    if args.no_speech_threshold is not None:
-        asr_options["no_speech_threshold"] = args.no_speech_threshold
-    if vad_options or asr_options:
-        print(f"Sensitivity: vad={vad_options or 'default'}, asr={asr_options or 'default'}")
-
     try:
-        extract_audio(args.input, wav)
-        segments, model_a, metadata, audio = transcribe(
-            wav, args.model, device, compute, args.batch, args.cache,
-            vad_options or None, asr_options or None)
-        duration = len(audio) / 16000.0               # WhisperX audio is 16 kHz mono
-        orig_words = write_transcript(segments, txt, args.flag_below)
-
-        if args.no_review:
-            entries = [{"kind": "existing", "idx": i, "tokens": [w["word"] for w in ws]}
-                       for i, ws in enumerate(orig_words)]
-            print("      Review skipped (--no-review).")
+        if args.from_words:
+            retimed = load_words(args.from_words)
+            print(f"Reusing the word timings in {args.from_words} — "
+                  f"{sum(len(r) for r in retimed)} words, nothing to transcribe.")
         else:
-            open_editor(txt)
-            entries = read_transcript(txt)
+            import torch
+            device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            compute = args.compute_type or ("float16" if device == "cuda" else "int8")
+            print(f"Device: {device} ({compute})")
 
-        retimed = retime(segments, orig_words, entries, model_a, metadata, audio, device, duration)
+            # build the VAD/ASR sensitivity overrides (defaults untouched unless asked)
+            vad_options, asr_options = {}, {}
+            if args.sensitive:
+                vad_options.update(vad_onset=0.3, vad_offset=0.2)
+                asr_options.update(no_speech_threshold=0.4)
+            if args.vad_onset is not None:
+                vad_options["vad_onset"] = args.vad_onset
+            if args.vad_offset is not None:
+                vad_options["vad_offset"] = args.vad_offset
+            if args.no_speech_threshold is not None:
+                asr_options["no_speech_threshold"] = args.no_speech_threshold
+            if vad_options or asr_options:
+                print(f"Sensitivity: vad={vad_options or 'default'}, asr={asr_options or 'default'}")
+
+            extract_audio(args.input, wav)
+            segments, model_a, metadata, audio = transcribe(
+                wav, args.model, device, compute, args.batch, args.cache,
+                vad_options or None, asr_options or None)
+            duration = len(audio) / 16000.0           # WhisperX audio is 16 kHz mono
+            orig_words = write_transcript(segments, txt, args.flag_below)
+
+            if args.no_review:
+                entries = [{"kind": "existing", "idx": i, "tokens": [w["word"] for w in ws]}
+                           for i, ws in enumerate(orig_words)]
+                print("      Review skipped (--no-review).")
+            else:
+                open_editor(txt)
+                entries = read_transcript(txt)
+
+            retimed = retime(segments, orig_words, entries,
+                             model_a, metadata, audio, device, duration)
         n_events = build_ass(retimed, theme, ass)
         print(f"      {n_events} caption events written.")
+
+        # Sidecars first: they cost minutes of transcription to produce and seconds to
+        # write, so don't risk losing them to a failed encode.
+        words_json, srt = out.with_suffix(".json"), out.with_suffix(".srt")
+        if not args.from_words or args.from_words.resolve() != words_json.resolve():
+            save_words(retimed, words_json)
+        n_cues = build_srt(retimed, theme, srt)
 
         burn(args.input, ass, out, args.bitrate, args.crf, args.cpu_used, args.threads)
 
         if args.keep_temp:
             for f in (wav, ass, txt):
-                shutil.copy2(f, out.with_name(out.stem + f.suffix))
+                if f.exists():                    # no .wav or transcript on the --from path
+                    shutil.copy2(f, out.with_name(out.stem + f.suffix))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     print(f"\nDone  ->  {out}")
+    print(f"         {srt}  ({n_cues} cues — a subtitle track viewers can turn off)")
+    print(f"         {words_json}  (re-theme instantly:  caption {args.input} "
+          f"--theme NAME --from {words_json})")
 
 
 if __name__ == "__main__":
