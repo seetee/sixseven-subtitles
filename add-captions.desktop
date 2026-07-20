@@ -9,12 +9,12 @@ X-KDE-RequiredNumberOfUrls=1
 [Desktop Action addCaptionsClassic]
 Name=Add captions (Swedish, classic)
 Icon=subtitles
-Exec=konsole --hold -e /home/kenneth/.local/bin/caption %f
+Exec=konsole --hold -e caption %f
 
 [Desktop Action addCaptionsPick]
 Name=Add captions (choose theme…)
 Icon=subtitles
-Exec=konsole --hold -e /home/kenneth/.local/bin/caption --ask-theme %f
+Exec=konsole --hold -e caption --ask-theme %f
 
 # ---------------------------------------------------------------------------
 # INSTALL (KDE Plasma 6 / Frameworks 6)
@@ -25,6 +25,10 @@ Exec=konsole --hold -e /home/kenneth/.local/bin/caption --ask-theme %f
 #
 # Right-click a .webm -> Captions -> Add captions.
 # Notes:
+#   * "caption" is resolved through $PATH, so this file works on any machine once
+#     the script is installed somewhere on it. If your desktop session doesn't have
+#     ~/.local/bin on PATH the entry will do nothing — put an absolute path in the
+#     two Exec= lines in that case.
 #   * %f is the file's local path (quoting handled for you).
 #   * konsole --hold keeps the window open so you can read the result / answer prompts.
 #   * Icon "subtitles" may not exist in every icon theme; if it's blank the entry still
