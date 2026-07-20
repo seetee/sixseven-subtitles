@@ -59,8 +59,9 @@ kbuildsycoca6                       # refresh menus, then reopen Dolphin
 `chmod +x` on the `.desktop` file is **required** on Plasma 6 — an un-executable service
 menu is ignored. `install -Dm755` above already sets that bit.
 
-The `.desktop` file hard-codes `/home/kenneth/.local/bin/caption`. If your home path differs,
-edit the two `Exec=` lines (or point them at `caption` alone, which resolves via `$PATH`).
+The `.desktop` file calls `caption` through `$PATH`, so the three commands above are the
+whole install on any machine. If your desktop session doesn't have `~/.local/bin` on `$PATH`,
+put an absolute path in the two `Exec=` lines instead.
 
 `themes.toml` is searched for in this order: the path given to `--themes`, then
 `~/.config/caption/themes.toml`, then next to the `caption` script. With none found, a
@@ -188,11 +189,24 @@ margin in pixels — raise it if wide words still crowd the edges.
 
 ---
 
-## Encoding knobs (VP8)
+## Encoding knobs
 
-Defaults: `--bitrate 4M`, `--cpu-used 2` (libvpx speed 0–5, higher = faster/rougher),
-`--threads 0` (auto). Add `--crf N` for constant-quality with the bitrate as a ceiling.
-The audio track is copied through untouched (`-c:a copy`), so only the video is re-encoded.
+Defaults: `--codec vp9`, `--bitrate 4M`, `--cpu-used 2` (libvpx speed 0–5, higher =
+faster/rougher), `--threads 0` (auto). Add `--crf N` for constant-quality with the bitrate as
+a ceiling. The audio track is copied through untouched (`-c:a copy`), so only the video is
+re-encoded.
+
+VP9 is the default because VP8 encodes on roughly one core no matter what `--threads` says.
+Measured on a 35 s 1080×1920 clip on 16 cores, same target bitrate, same output size:
+
+| | encode time |
+|---|---|
+| VP8 (the old default) | 188 s |
+| **VP9 `--cpu-used 2`** | **73 s** |
+| VP9 `--cpu-used 4` | 57 s |
+
+Both are VP9-in-webm with Vorbis audio, which every current browser plays. `--codec vp8` is
+still there if something downstream insists on it.
 
 ---
 

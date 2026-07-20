@@ -11,7 +11,7 @@ Flow:
       -> re-time: keep timings if a line's word count is unchanged,
          otherwise re-align just that line against the audio
       -> build a themed ASS file                        (themes.toml)
-      -> burn it into the .webm                         (ffmpeg, VP8 / copy Vorbis)
+      -> burn it into the .webm                         (ffmpeg, VP9 / copy Vorbis)
       -> leave a .srt and a .json of the word timings next to the output
 
 Usage:
@@ -698,12 +698,19 @@ def _filter_path(p):
     return s
 
 
-def burn(src, ass, out, bitrate, crf, cpu_used, threads):
+def burn(src, ass, out, codec, bitrate, crf, cpu_used, threads):
     # The `ass` filter has no `charenc` option (that belongs to the `subtitles` filter).
     # libass reads .ass as UTF-8 by default, which is exactly what we write, so none is needed.
     vf = f"ass={_filter_path(ass)}"
-    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf,
-           "-c:v", "libvpx", "-b:v", bitrate]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf]
+    if codec == "vp8":
+        cmd += ["-c:v", "libvpx"]
+    else:
+        # VP8 encodes on essentially one core. VP9's row multithreading uses the rest:
+        # measured on a 35 s 1080x1920 clip, 16 cores, same target bitrate and output
+        # size, 188 s -> 73 s. Everything else about the webm is unchanged.
+        cmd += ["-c:v", "libvpx-vp9", "-row-mt", "1", "-tile-columns", "2"]
+    cmd += ["-b:v", bitrate]
     if crf is not None:
         cmd += ["-crf", str(crf)]
     cmd += ["-deadline", "good", "-cpu-used", str(cpu_used), "-threads", str(threads),
@@ -737,8 +744,10 @@ def main():
     ap.add_argument("--vad-offset", type=float, help="VAD offset threshold (default 0.363; lower catches fainter speech)")
     ap.add_argument("--no-speech-threshold", type=float,
                     help="Whisper no-speech cutoff (default 0.6; lower keeps more borderline-quiet audio)")
-    ap.add_argument("--bitrate", default="4M", help="VP8 target video bitrate")
-    ap.add_argument("--crf", type=int, help="VP8 quality (lower = better); pairs with --bitrate as a cap")
+    ap.add_argument("--codec", choices=["vp9", "vp8"], default="vp9",
+                    help="video codec (default vp9: same webm, same size, ~3x faster than vp8)")
+    ap.add_argument("--bitrate", default="4M", help="target video bitrate")
+    ap.add_argument("--crf", type=int, help="quality (lower = better); pairs with --bitrate as a cap")
     ap.add_argument("--cpu-used", type=int, default=2, help="libvpx speed 0..5 (higher = faster, lower quality)")
     ap.add_argument("--threads", type=int, default=0, help="encoder threads (0 = auto)")
     ap.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "caption-models",
@@ -854,7 +863,8 @@ def main():
             save_words(retimed, words_json)
         n_cues = build_srt(retimed, theme, srt)
 
-        burn(args.input, ass, out, args.bitrate, args.crf, args.cpu_used, args.threads)
+        burn(args.input, ass, out, args.codec, args.bitrate, args.crf,
+             args.cpu_used, args.threads)
 
         if args.keep_temp:
             for f in (wav, ass, txt):
