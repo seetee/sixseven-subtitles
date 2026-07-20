@@ -13,7 +13,8 @@ webm in
   → you fix words in $EDITOR / Kate           ← the one pause
   → re-time                                   (unchanged lines keep timing; edited lines re-align)
   → build a themed ASS file                   (themes.toml)
-  → burn it in                                (ffmpeg, VP8 video, Vorbis copied through)
+  → burn it in                                (ffmpeg, VP9 video, Vorbis copied through)
+  → leave a .srt and a .json beside the output
 ```
 
 The pause is by design: a step that lets you correct words cannot also be unattended. On
@@ -23,12 +24,12 @@ KDE the packaging is still one click — right-click → *Captions* → *Add cap
 
 ## Requirements
 
-- **ffmpeg** built with `libvpx` (VP8) and `libass` (subtitle burn-in). Check:
+- **ffmpeg** built with `libvpx` (VP8/VP9) and `libass` (subtitle burn-in). Check:
   ```
-  ffmpeg -hide_banner -encoders | grep -w libvpx     # VP8 encoder present
-  ffmpeg -hide_banner -filters  | grep -w ass        # ass filter present
+  ffmpeg -hide_banner -encoders | grep -w libvpx-vp9  # VP9 encoder present (the default)
+  ffmpeg -hide_banner -filters  | grep -w ass         # ass filter present
   ```
-- **Python 3.11+** (uses the stdlib `tomllib`; falls back to `tomli` on older Pythons).
+- **Python 3.11+** (uses the stdlib `tomllib`).
 - **python3-venv** for the first-run bootstrap. On Debian/Ubuntu: `sudo apt install python3-venv`.
 
 You do **not** need to install WhisperX or PyTorch yourself. On first run the tool builds a
@@ -45,7 +46,7 @@ download on the first transcription to `~/.cache/caption-models` — a few GB, o
 ## Install
 
 ```bash
-# 1. the tool  (the service menu expects it here)
+# 1. the tool  (anywhere on $PATH; the service menu resolves it by name)
 install -Dm755 caption ~/.local/bin/caption
 
 # 2. themes
@@ -205,8 +206,8 @@ Measured on a 35 s 1080×1920 clip on 16 cores, same target bitrate, same output
 | **VP9 `--cpu-used 2`** | **73 s** |
 | VP9 `--cpu-used 4` | 57 s |
 
-Both are VP9-in-webm with Vorbis audio, which every current browser plays. `--codec vp8` is
-still there if something downstream insists on it.
+Either way the output is webm with the Vorbis track copied through, which every current
+browser plays. `--codec vp8` is still there if something downstream insists on it.
 
 ---
 
@@ -235,11 +236,14 @@ isn't used (WhisperX passes audio in-memory), so the run continues. To silence i
 
 ## Honest caveats
 
-- **Burning re-encodes the video**, and VP8 is not fast. That is the price of a `.webm` out
-  that matches your existing Kdenlive/Vorbis workflow. If you ever don't need webm, H.264/mp4
-  encodes several times faster and the platforms re-compress the upload anyway.
-- **Changing the theme re-runs transcription** — there is no cached-transcript reuse. Pick the
-  theme up front with `-t` or `--ask-theme` to avoid transcribing twice.
+- **Burning re-encodes the video**, and that is the slowest step by a distance — roughly 73 s
+  of a 90 s run on a 35 s clip, against 15 s for the transcription. It is the price of a
+  `.webm` out that matches your existing Kdenlive/Vorbis workflow. If you ever don't need
+  webm, H.264/mp4 encodes faster still and the platforms re-compress the upload anyway.
+- **A GPU barely helps.** CUDA accelerates transcription and alignment only, which is the
+  small end of the run; on a 35 s clip it saves on the order of ten seconds. The encode is
+  CPU-bound either way. `--device cuda` works if you have a CUDA torch installed, but don't
+  install one expecting a big win.
 - **Added rows are placed by forced alignment**, which assigns every word you type a time. A
   word that was genuinely spoken (just too quietly to be caught) lands in the right place; a
   word that *isn't* in the audio at all gets forced in somewhere anyway. Add what was said, in
