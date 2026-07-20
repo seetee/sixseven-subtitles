@@ -97,6 +97,11 @@ def run(cmd, quiet=False):
     subprocess.run(cmd, check=True)
 
 
+def ass_text(s):
+    """Escape caption text so it can't be read as ASS override tags."""
+    return s.replace("\\", "⧵").replace("{", "\\{").replace("}", "\\}")
+
+
 def hex_to_ass(h, alpha="00"):
     """#RRGGBB -> ASS &HAABBGGRR (alpha 00 = opaque)."""
     h = h.lstrip("#")
@@ -555,7 +560,7 @@ def build_ass(segments_words, theme, path):
                 for j, w in enumerate(line):
                     nxt = line[j + 1]["start"] if j + 1 < len(line) else l_end
                     cs = max(1, int(round((nxt - w["start"]) * 100)))
-                    parts.append(f"{{\\kf{cs}}}{w['word']}")
+                    parts.append(f"{{\\kf{cs}}}{ass_text(w['word'])}")
                 events.append(f"Dialogue: 0,{ts(l_start)},{ts(l_end)},Cap,,0,0,0,,{' '.join(parts)}")
             else:
                 # one event per active word; that word is recoloured (and optionally enlarged)
@@ -567,9 +572,9 @@ def build_ass(segments_words, theme, path):
                     chips = []
                     for k, ww in enumerate(line):
                         if k == j:
-                            chips.append(f"{{\\c{accent}&{pop}}}{ww['word']}{{\\r}}")
+                            chips.append(f"{{\\c{accent}&{pop}}}{ass_text(ww['word'])}{{\\r}}")
                         else:
-                            chips.append(ww["word"])
+                            chips.append(ass_text(ww["word"]))
                     events.append(f"Dialogue: 0,{ts(start)},{ts(end)},Cap,,0,0,0,,{' '.join(chips)}")
 
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
