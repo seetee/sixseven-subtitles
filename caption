@@ -33,12 +33,8 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
-
-try:
-    import tomllib                       # Python 3.11+
-except ModuleNotFoundError:              # older Python: pip install tomli
-    import tomli as tomllib
 
 # --------------------------------------------------------------------------- #
 #  Defaults
@@ -491,11 +487,6 @@ def retime(orig_segments, orig_words, entries, model_a, metadata, audio, device,
 # --------------------------------------------------------------------------- #
 #  Step 5a — build the themed ASS
 # --------------------------------------------------------------------------- #
-def chunk(words, n):
-    for i in range(0, len(words), n):
-        yield words[i:i + n]
-
-
 def split_even(words, target):
     """Split a word list into near-equal rows of at most `target` words, avoiding a
     lone trailing word: 7 words at target 3 -> [3, 2, 2], not [3, 3, 1]."""
